@@ -1,0 +1,30 @@
+# Direct dependencies only; transitive ones resolve automatically.
+#   pip install -r requirements.txt
+
+Django==6.1.1
+djangorestframework==3.18.0
+django-cors-headers==4.9.0
+psycopg2-binary==2.9.12
+
+# Configuration from backend/.env
+django-environ==0.14.0
+
+# core.fields.EncryptedCharField
+cryptography==50.0.1
+
+# Authentication: JWT plus TOTP multi-factor
+djangorestframework-simplejwt==5.5.1
+pyotp==2.10.0
+qrcode[pil]==8.2
+
+# OpenAPI schema at /api/schema/ and Swagger UI at /api/docs/
+drf-spectacular==0.30.0
+
+# canvas_integration.client
+requests==2.34.2
+
+# Tests
+pytest==9.1.1
+pytest-django==4.14.0
+freezegun==1.5.5
+responses==0.26.3
