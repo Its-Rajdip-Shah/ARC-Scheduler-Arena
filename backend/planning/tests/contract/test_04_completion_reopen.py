@@ -49,6 +49,7 @@ def _dependency_model():
 def test_CR1_complete_atomic_leaf_leaves_active_frontier(user, make_item):
     item = make_item(user, "Atomic")
     priority.reconcile(user)
+    item.refresh_from_db()
     assert item.priority_position is not None
 
     hierarchy.complete_subtree(item)

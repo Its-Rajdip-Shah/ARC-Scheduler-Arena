@@ -122,7 +122,12 @@ def test_VIEW_001_priority_mutation_is_immediately_canonical_for_all_projections
 
     # Support the common service signatures without baking UI semantics in.
     called = False
-    for args in ((c, 0), (user, c, 0), (c, 1), (user, c, 1)):
+    for args in (
+        (user, c.pk, 1),
+        (user, c, 1),
+        (c, 1),
+        (c, 0),
+    ):
         try:
             move(*args)
             called = True
@@ -172,7 +177,11 @@ def test_VIEW_002_timeline_anchor_counts_without_priority_repair_hop(
     target = today + timedelta(days=2)
 
     called = False
-    for args in ((item, target), (user, item, target)):
+    for args in (
+        (user, item.pk, target),
+        (user, item, target),
+        (item, target),
+    ):
         try:
             move(*args)
             called = True

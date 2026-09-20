@@ -126,7 +126,7 @@ class PlanningItemSerializer(serializers.ModelSerializer):
         return value
 
     def create(self, validated_data):
-        from planning.services import scheduling
+        from planning.services import priority, scheduling
 
         detail = validated_data.pop('assignment_detail', None)
         tags = validated_data.pop('tags', None)
@@ -170,9 +170,17 @@ class PlanningItemSerializer(serializers.ModelSerializer):
         if tags:
             self._set_tags(item, tags)
 
-        # Reconcile global priority because creating a child can make its
-        # parent no longer priority-eligible.
+        # Creation changes canonical frontier membership:
+        #
+        # * a new executable root/leaf enters global priority;
+        # * a first unfinished child makes its parent structural;
+        # * a child created under a structural branch becomes frontier work.
+        #
+        # Reconcile canonical priority here. The scheduler must only consume
+        # this already-reconciled state.
+        priority.reconcile(user)
         scheduling.schedule(user)
+
         item.refresh_from_db()
         return item
 
@@ -190,9 +198,34 @@ class PlanningItemSerializer(serializers.ModelSerializer):
         if tags is not serializers.empty:
             self._set_tags(instance, tags)
 
-        if {'item_type', 'start_date', 'due_date', 'duration_category', 'parent', 'is_completed', 'scheduled_date', 'schedule_is_manual'} & validated_data.keys():
+        changed = set(validated_data)
+
+        frontier_fields = {
+            'item_type',
+            'parent',
+            'is_completed',
+        }
+
+        scheduling_fields = {
+            'item_type',
+            'start_date',
+            'due_date',
+            'duration_category',
+            'parent',
+            'is_completed',
+            'scheduled_date',
+            'manual_requested_date',
+            'schedule_is_manual',
+        }
+
+        if frontier_fields & changed:
+            from planning.services import priority
+            priority.reconcile(instance.user)
+
+        if scheduling_fields & changed:
             from planning.services import scheduling
             scheduling.schedule(instance.user)
+
         instance.refresh_from_db()
         return instance
 

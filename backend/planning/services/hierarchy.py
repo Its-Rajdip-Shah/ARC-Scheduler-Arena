@@ -10,7 +10,7 @@ from django.db import transaction
 from planning.models import PlanningItem
 from planning.queries import MAX_DEPTH, ancestor_ids, descendant_ids
 
-from . import scheduling
+from . import priority, scheduling
 
 
 def validate_parent(item, new_parent):
@@ -59,7 +59,10 @@ def set_parent(item, new_parent):
     reindex_siblings(item.user, old_parent)
     reindex_siblings(item.user, new_parent)
 
-    # Moving an item can change leaf eligibility for both its old and new parent.
+    # Reparenting can change frontier eligibility for the moved item,
+    # its old parent and its new parent. Canonical priority must therefore
+    # reconcile here, before the scheduler consumes the resulting state.
+    priority.reconcile(item.user)
     scheduling.schedule(item.user)
 
     item.refresh_from_db(fields=['priority_position'])
@@ -101,9 +104,19 @@ def complete_subtree(item):
     that a position belongs to an active task.
     """
     ids = [item.pk] + descendant_ids(item.user_id, item.pk)
-    PlanningItem.objects.visible().filter(user_id=item.user_id, pk__in=ids).update(is_completed=True)
+
+    PlanningItem.objects.visible().filter(
+        user_id=item.user_id,
+        pk__in=ids,
+    ).update(is_completed=True)
+
+    # Completion is a canonical frontier transition. Departing tasks must
+    # lose their active positions while preserving restore neighbourhood,
+    # and newly exposed residual ancestors must enter that neighbourhood.
+    priority.reconcile(item.user)
     scheduling.schedule(item.user)
-    item.is_completed = True
+
+    item.refresh_from_db()
     return ids
 
 
@@ -115,8 +128,15 @@ def reopen(item):
     downwards, and re-opening a root should not silently re-open a subtree the
     user finished individually.
     """
-    PlanningItem.objects.visible().filter(pk=item.pk).update(is_completed=False)
-    item.is_completed = False
+    PlanningItem.objects.visible().filter(
+        pk=item.pk,
+        user=item.user,
+    ).update(is_completed=False)
+
+    # Reopening may return this task to the frontier and may simultaneously
+    # make an ancestor structural again. Restore canonical priority first.
+    priority.reconcile(item.user)
     scheduling.schedule(item.user)
-    item.refresh_from_db(fields=['priority_position'])
+
+    item.refresh_from_db()
     return item
