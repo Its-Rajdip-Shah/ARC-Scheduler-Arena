@@ -173,7 +173,12 @@ def test_VIEW_002_timeline_anchor_counts_without_priority_repair_hop(
 
     item = make_item(user, "Move me")
     priority.reconcile(user)
+
+    # reconcile() uses queryset/bulk updates, so refresh the already-created
+    # ORM instance before capturing the canonical pre-transition state.
+    item.refresh_from_db()
     before_priority = item.priority_position
+
     target = today + timedelta(days=2)
 
     called = False

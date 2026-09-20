@@ -11,6 +11,7 @@ from planning.models import (
     SPLITTABLE_DURATION_CATEGORIES,
     PlanningItem,
     ProgressSegment,
+    SchedulerAllocation,
 )
 
 
@@ -83,18 +84,96 @@ edit_duration_category = set_duration
 
 
 @transaction.atomic
-def complete_segment(segment: ProgressSegment):
-    """Confirm one scheduler allocation as durable canonical progress."""
-    segment = ProgressSegment.objects.select_for_update().select_related("item").get(
-        pk=segment.pk
+def complete_segment(segment):
+    """Confirm one allocation/segment as durable canonical progress.
+
+    SchedulerAllocation is disposable proposal state. Confirmation creates a
+    ProgressSegment with durable identity before canonical progress changes.
+
+    Passing an existing ProgressSegment remains supported for compatibility.
+    """
+
+    if isinstance(segment, SchedulerAllocation):
+        allocation = (
+            SchedulerAllocation.objects
+            .select_for_update()
+            .select_related("item")
+            .get(pk=segment.pk)
+        )
+
+        item = (
+            PlanningItem.objects
+            .select_for_update()
+            .get(pk=allocation.item_id)
+        )
+
+        if item.duration_category not in {
+            str(v) for v in SPLITTABLE_DURATION_CATEGORIES
+        }:
+            raise ValidationError(
+                "Atomic work cannot confirm partial allocations."
+            )
+
+        remaining = Decimal("100") - _decimal(item.percent_completed)
+        amount = min(_decimal(allocation.percentage), remaining)
+
+        if amount <= 0:
+            allocation.delete()
+            return None
+
+        canonical = ProgressSegment.objects.create(
+            item=item,
+            percentage=amount,
+            scheduled_date=allocation.scheduled_date,
+            is_completed=True,
+            completed_at=timezone.now(),
+        )
+
+        item.percent_completed = min(
+            Decimal("100"),
+            _decimal(item.percent_completed) + amount,
+        )
+
+        if item.percent_completed >= Decimal("100"):
+            item.percent_completed = Decimal("100")
+            item.is_completed = True
+            item.save(
+                update_fields=[
+                    "percent_completed",
+                    "is_completed",
+                ]
+            )
+        else:
+            item.save(update_fields=["percent_completed"])
+
+        # This proposal has now crossed the authority boundary and has been
+        # replaced by canonical progress history.
+        allocation.delete()
+
+        return canonical
+
+    segment = (
+        ProgressSegment.objects
+        .select_for_update()
+        .select_related("item")
+        .get(pk=segment.pk)
     )
-    item = PlanningItem.objects.select_for_update().get(pk=segment.item_id)
+
+    item = (
+        PlanningItem.objects
+        .select_for_update()
+        .get(pk=segment.item_id)
+    )
 
     if segment.is_completed:
         return segment
 
-    if item.duration_category not in {str(v) for v in SPLITTABLE_DURATION_CATEGORIES}:
-        raise ValidationError("Atomic work cannot confirm partial progress segments.")
+    if item.duration_category not in {
+        str(v) for v in SPLITTABLE_DURATION_CATEGORIES
+    }:
+        raise ValidationError(
+            "Atomic work cannot confirm partial progress segments."
+        )
 
     remaining = Decimal("100") - _decimal(item.percent_completed)
     amount = min(_decimal(segment.percentage), remaining)
@@ -102,7 +181,13 @@ def complete_segment(segment: ProgressSegment):
     segment.percentage = amount
     segment.is_completed = True
     segment.completed_at = timezone.now()
-    segment.save(update_fields=["percentage", "is_completed", "completed_at"])
+    segment.save(
+        update_fields=[
+            "percentage",
+            "is_completed",
+            "completed_at",
+        ]
+    )
 
     item.percent_completed = min(
         Decimal("100"),
@@ -112,7 +197,12 @@ def complete_segment(segment: ProgressSegment):
     if item.percent_completed >= Decimal("100"):
         item.percent_completed = Decimal("100")
         item.is_completed = True
-        item.save(update_fields=["percent_completed", "is_completed"])
+        item.save(
+            update_fields=[
+                "percent_completed",
+                "is_completed",
+            ]
+        )
     else:
         item.save(update_fields=["percent_completed"])
 

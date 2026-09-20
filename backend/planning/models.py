@@ -211,6 +211,15 @@ class PlanningItem(OwnedModel, TimestampedModel):
     # Once no history entry can restore the deletion, history GC may
     # permanently remove the row.
     is_deleted = models.BooleanField(default=False, db_index=True)
+
+    # Durable lifecycle context used by validated delete/restore.
+    #
+    # This is deliberately canonical history rather than scheduler state:
+    # deletion may suspend hierarchy/dependency/anchor relationships and a
+    # later restore must validate those original relationships against the
+    # world as it exists at restore time.
+    deletion_restore_context = models.JSONField(default=dict, blank=True)
+
     canvas_object_type = models.CharField(
         max_length=10, choices=CanvasObjectType.choices, null=True, blank=True
     )
@@ -305,6 +314,42 @@ class PlanningDependency(models.Model):
 
     def __str__(self):
         return f'{self.prerequisite_id} -> {self.dependent_id}'
+
+
+class SchedulerAllocation(models.Model):
+    """Disposable scheduler-owned allocation proposal.
+
+    This is NOT canonical progress and is NOT a semantic PlanningItem child.
+    Rows may be freely destroyed/rebuilt whenever ARC reschedules.
+
+    Only explicit user confirmation converts an allocation into durable
+    ProgressSegment history and changes PlanningItem.percent_completed.
+    """
+
+    item = models.ForeignKey(
+        PlanningItem,
+        on_delete=models.CASCADE,
+        related_name='scheduler_allocations',
+    )
+    percentage = models.DecimalField(max_digits=5, decimal_places=2)
+    scheduled_date = models.DateField()
+    execution_rank = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        db_table = 'planning_scheduler_allocations'
+        ordering = ['scheduled_date', 'execution_rank', 'id']
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(percentage__gt=0) & Q(percentage__lte=100),
+                name='scheduler_allocation_percentage_range',
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f'{self.item_id}: {self.percentage}% '
+            f'on {self.scheduled_date}'
+        )
 
 
 class ProgressSegment(models.Model):

@@ -12,6 +12,7 @@ from planning.models import (
     DurationCategory,
     PlanningItem,
     ProgressSegment,
+    SchedulerAllocation,
     SchedulingOverload,
     SchedulingPreference,
     SchedulingState,
@@ -335,8 +336,19 @@ def move_to_date(user, item_id, day, *, allow_overload=False, today=None):
         raise SchedulingConflict([_conflict(item, 'duration_required')])
     if allow_overload:
         SchedulingOverload.objects.update_or_create(user=user, date=day, defaults={'allowed': True})
-    item.scheduled_date, item.schedule_is_manual = day, True
-    item.save(update_fields=['scheduled_date', 'schedule_is_manual'])
+    # Explicit Timeline movement is canonical date intent, not merely a
+    # disposable scheduler suggestion. The scheduler may reproduce
+    # scheduled_date from this anchor, but cannot silently erase the intent.
+    item.manual_requested_date = day
+    item.scheduled_date = day
+    item.schedule_is_manual = True
+    item.save(
+        update_fields=[
+            'manual_requested_date',
+            'scheduled_date',
+            'schedule_is_manual',
+        ]
+    )
     # Existing conflicts on the manipulated item must not be swallowed.
     baseline = {pair for pair in baseline if pair[0] != item.pk}
     return _finish(user, before, today, baseline)
@@ -510,17 +522,16 @@ def _allocation_count(category):
 
 
 def _reconcile_progress_allocations(user, today=None):
-    today = today or timezone.localdate()
+    """Rebuild disposable allocations from current canonical remaining work."""
 
+    today = today or timezone.localdate()
     candidates = list(_scheduler_eligible(user))
 
-    candidate_ids = {item.pk for item in candidates}
+    # Scheduler proposals are disposable by definition. A rerun may replace
+    # every proposal without touching confirmed canonical progress history.
+    SchedulerAllocation.objects.filter(item__user=user).delete()
 
-    # Proposed segments are disposable. Confirmed segments are durable.
-    ProgressSegment.objects.filter(
-        item__user=user,
-        is_completed=False,
-    ).delete()
+    allocations = []
 
     for item in candidates:
         if item.duration_category not in _SPLITTABLE_VALUES:
@@ -535,20 +546,28 @@ def _reconcile_progress_allocations(user, today=None):
         pieces = [base] * count
         pieces[-1] += remaining - sum(pieces)
 
-        first_day = item.scheduled_date or max(today, item.start_date or today)
+        first_day = (
+            item.scheduled_date
+            or max(today, item.start_date or today)
+        )
 
-        ProgressSegment.objects.bulk_create(
-            [
-                ProgressSegment(
+        for index, percentage in enumerate(pieces):
+            if percentage <= 0:
+                continue
+
+            allocations.append(
+                SchedulerAllocation(
                     item=item,
                     percentage=percentage,
                     scheduled_date=first_day + timedelta(days=index),
-                    is_completed=False,
+                    execution_rank=index + 1,
                 )
-                for index, percentage in enumerate(pieces)
-                if percentage > 0
-            ]
-        )
+            )
+
+    if allocations:
+        SchedulerAllocation.objects.bulk_create(allocations)
+
+
 
 
 # Re-export progress lifecycle commands through scheduling because scheduling
