@@ -105,8 +105,9 @@ def schedule(user, today=None, *, mode='minimal'):
     if mode not in {'minimal', 'global'}:
         raise ValueError('Unknown scheduling mode')
     today = today or timezone.localdate()
+    # Scheduling may read/lock canonical priority, but it has no authority
+    # to repair or manufacture canonical priority as a side effect.
     priority._lock(user)
-    priority.reconcile(user)
     limits = capacities(user)
     overloaded = set(SchedulingOverload.objects.filter(user=user, allowed=True).values_list('date', flat=True))
     items = sorted(_scheduler_eligible(user), key=_scheduling_order)
