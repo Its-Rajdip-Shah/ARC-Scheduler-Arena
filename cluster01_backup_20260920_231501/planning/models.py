@@ -30,35 +30,9 @@ RECENT_OVERDUE_DAYS = 7
 
 
 class DurationCategory(models.TextChoices):
-    # Frozen ARC duration semantics.
-    #
-    # Atomic / one-day:
-    #   <20m, <1h, <4h
-    #
-    # Splittable:
-    #   <8h, <16h, >16h
-    #
-    # The labels are intentionally simple while the enum values provide
-    # mutually-exclusive semantic buckets to the domain.
-    UNDER_20_MINUTES = 'UNDER_20_MINUTES', 'Under 20 minutes'
-    UNDER_1_HOUR = 'UNDER_1_HOUR', 'Under 1 hour'
-    UNDER_4_HOURS = 'UNDER_4_HOURS', 'Under 4 hours'
-    UNDER_8_HOURS = 'UNDER_8_HOURS', 'Under 8 hours'
-    UNDER_16_HOURS = 'UNDER_16_HOURS', 'Under 16 hours'
-    OVER_16_HOURS = 'OVER_16_HOURS', 'Over 16 hours'
-
-
-ATOMIC_DURATION_CATEGORIES = (
-    DurationCategory.UNDER_20_MINUTES,
-    DurationCategory.UNDER_1_HOUR,
-    DurationCategory.UNDER_4_HOURS,
-)
-
-SPLITTABLE_DURATION_CATEGORIES = (
-    DurationCategory.UNDER_8_HOURS,
-    DurationCategory.UNDER_16_HOURS,
-    DurationCategory.OVER_16_HOURS,
-)
+    UNDER_20_MIN = 'UNDER_20_MIN', 'Under 20 minutes'
+    MIN_20_TO_60 = 'MIN_20_TO_60', '20 to 60 minutes'
+    OVER_60_MIN = 'OVER_60_MIN', 'Over 60 minutes'
 
 
 class CanvasObjectType(models.TextChoices):
@@ -116,11 +90,6 @@ class PlanningItemQuerySet(models.QuerySet):
                 )
             )
             .filter(incomplete_child_count=0)
-            .exclude(
-                blocked_by_dependencies__prerequisite__is_completed=False,
-                blocked_by_dependencies__prerequisite__is_deleted=False,
-            )
-            .distinct()
         )
 
     def fixed(self):
@@ -180,30 +149,10 @@ class PlanningItem(OwnedModel, TimestampedModel):
     due_date = models.DateField(null=True, blank=True)
     # Planned execution date, independent of release/deadline constraints.
     scheduled_date = models.DateField(null=True, blank=True)
-
-    # Canonical explicit user date intent. This is deliberately distinct from
-    # scheduled_date, which is a disposable scheduler proposal.
-    manual_requested_date = models.DateField(null=True, blank=True)
-
-    # Legacy execution-placement marker retained temporarily while the anchor
-    # lifecycle is migrated onto manual_requested_date in the anchor cluster.
     schedule_is_manual = models.BooleanField(default=False)
-
     priority_restore_context = models.JSONField(default=dict, blank=True)
-
     duration_category = models.CharField(
-        max_length=20,
-        choices=DurationCategory.choices,
-        default=DurationCategory.UNDER_1_HOUR,
-    )
-
-    # Canonical confirmed progress for splittable work. Atomic categories do
-    # not use partial-progress semantics and therefore remain at zero until
-    # completed.
-    percent_completed = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=0,
+        max_length=12, choices=DurationCategory.choices, default=DurationCategory.MIN_20_TO_60
     )
     priority_position = models.PositiveIntegerField(null=True, blank=True)
     is_completed = models.BooleanField(default=False)
@@ -268,78 +217,6 @@ class PlanningItem(OwnedModel, TimestampedModel):
     def has_deadline(self):
         """Whether this item has a factual deadline constraint."""
         return self.due_date is not None
-
-
-class PlanningDependency(models.Model):
-    """Canonical completion-based hard precedence edge.
-
-    prerequisite -> dependent means dependent work cannot become executable
-    until the prerequisite is complete.
-
-    This relation is intentionally independent from hierarchy and priority.
-    """
-
-    prerequisite = models.ForeignKey(
-        PlanningItem,
-        on_delete=models.CASCADE,
-        related_name='required_by_dependencies',
-    )
-    dependent = models.ForeignKey(
-        PlanningItem,
-        on_delete=models.CASCADE,
-        related_name='blocked_by_dependencies',
-    )
-
-    class Meta:
-        db_table = 'planning_dependencies'
-        constraints = [
-            models.UniqueConstraint(
-                fields=['prerequisite', 'dependent'],
-                name='uniq_planning_dependency_edge',
-            ),
-            models.CheckConstraint(
-                condition=~Q(prerequisite=F('dependent')),
-                name='planning_dependency_no_self_edge',
-            ),
-        ]
-
-    def __str__(self):
-        return f'{self.prerequisite_id} -> {self.dependent_id}'
-
-
-class ProgressSegment(models.Model):
-    """Durable identity for a confirmed or proposed slice of splittable work.
-
-    A segment is NOT a PlanningItem and therefore never participates in the
-    semantic parent/child hierarchy.
-
-    Unconfirmed rows may be replaced by future scheduler proposals.
-    Confirmed rows become durable canonical progress history.
-    """
-
-    item = models.ForeignKey(
-        PlanningItem,
-        on_delete=models.CASCADE,
-        related_name='progress_segments',
-    )
-    percentage = models.DecimalField(max_digits=5, decimal_places=2)
-    scheduled_date = models.DateField(null=True, blank=True)
-    is_completed = models.BooleanField(default=False)
-    completed_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        db_table = 'planning_progress_segments'
-        ordering = ['scheduled_date', 'id']
-        constraints = [
-            models.CheckConstraint(
-                condition=Q(percentage__gt=0) & Q(percentage__lte=100),
-                name='progress_segment_percentage_range',
-            ),
-        ]
-
-    def __str__(self):
-        state = 'confirmed' if self.is_completed else 'proposed'
-        return f'{self.item_id}: {self.percentage}% ({state})'
 
 
 class PlanningHistoryEntry(OwnedModel):

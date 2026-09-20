@@ -1,0 +1,24 @@
+{
+  "generated_for": "ARC Scheduler Arena",
+  "reference_today": "2026-09-20",
+  "scenario_count": 49,
+  "item_count": 2429,
+  "families": {
+    "micro": 12,
+    "random": 25,
+    "realistic": 4,
+    "stress": 8
+  },
+  "files": [
+    "scenarios.csv",
+    "items.csv",
+    "capacities.csv"
+  ],
+  "notes": [
+    "parent_key is scenario-local and forms the hierarchy.",
+    "release_date maps to ARC start_date.",
+    "anchored maps to ARC schedule_is_manual.",
+    "Experimental duration classes are intentionally present for Arena experiments and require mapping when materialising into current ARC's 3-class schema.",
+    "Canonical input fixtures should be reloaded/reset between algorithm runs."
+  ]
+}

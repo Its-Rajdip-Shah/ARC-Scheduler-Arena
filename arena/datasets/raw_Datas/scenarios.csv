@@ -1,0 +1,50 @@
+scenario,family,description,today,seed
+micro_release_only,micro,Release bound only,2026-09-20,1
+micro_due_only,micro,Deadline bound only,2026-09-20,2
+micro_release_and_due,micro,Both release and deadline,2026-09-20,3
+micro_release_equals_due,micro,Only one legal execution day,2026-09-20,4
+micro_no_constraints,micro,No temporal constraints,2026-09-20,5
+micro_anchored,micro,Manual anchored execution,2026-09-20,6
+micro_anchor_collision,micro,Multiple anchored items collide,2026-09-20,7
+micro_deep_frontier,micro,Deep hierarchy exposes only frontier leaf,2026-09-20,8
+micro_new_frontier,micro,Completion exposes a new parent/frontier item,2026-09-20,9
+micro_priority_vs_deadline,micro,High priority distant work competes with imminent lower priority,2026-09-20,10
+micro_completion_frees_capacity,micro,Completion creates earlier capacity,2026-09-20,11
+micro_unavoidable_overload,micro,Legal window requires controlled overload,2026-09-20,12
+realistic_normal_semester,realistic,"Balanced semester with university, career and personal-project work.",2026-09-20,101
+realistic_deadline_heavy,realistic,Assessment-heavy fortnight with several close deadlines.,2026-09-20,102
+realistic_project_heavy,realistic,Deep project decomposition and long technical work.,2026-09-20,103
+realistic_overloaded_semester,realistic,Realistic but intentionally overcommitted semester.,2026-09-20,104
+stress_50_same_deadline,stress,50 tasks share one deadline,2026-09-20,201
+stress_late_release_burst,stress,Many tasks released shortly before deadline,2026-09-20,202
+stress_dense_fortnight,stress,Very dense two-week workload,2026-09-20,203
+stress_sparse_quarter,stress,Sparse three-month workload,2026-09-20,204
+stress_priority_ties,stress,Many identical priorities,2026-09-20,205
+stress_many_anchors,stress,Large number of anchored tasks,2026-09-20,206
+stress_deep_hierarchy,stress,Very deep nested hierarchy,2026-09-20,207
+stress_impossible_capacity,stress,Workload exceeds nominal capacity,2026-09-20,208
+random_1001,random,Seeded random mixed workload (1001),2026-09-20,1001
+random_1002,random,Seeded random mixed workload (1002),2026-09-20,1002
+random_1003,random,Seeded random mixed workload (1003),2026-09-20,1003
+random_1004,random,Seeded random mixed workload (1004),2026-09-20,1004
+random_1005,random,Seeded random mixed workload (1005),2026-09-20,1005
+random_1006,random,Seeded random mixed workload (1006),2026-09-20,1006
+random_1007,random,Seeded random mixed workload (1007),2026-09-20,1007
+random_1008,random,Seeded random mixed workload (1008),2026-09-20,1008
+random_1009,random,Seeded random mixed workload (1009),2026-09-20,1009
+random_1010,random,Seeded random mixed workload (1010),2026-09-20,1010
+random_1011,random,Seeded random mixed workload (1011),2026-09-20,1011
+random_1012,random,Seeded random mixed workload (1012),2026-09-20,1012
+random_1013,random,Seeded random mixed workload (1013),2026-09-20,1013
+random_1014,random,Seeded random mixed workload (1014),2026-09-20,1014
+random_1015,random,Seeded random mixed workload (1015),2026-09-20,1015
+random_1016,random,Seeded random mixed workload (1016),2026-09-20,1016
+random_1017,random,Seeded random mixed workload (1017),2026-09-20,1017
+random_1018,random,Seeded random mixed workload (1018),2026-09-20,1018
+random_1019,random,Seeded random mixed workload (1019),2026-09-20,1019
+random_1020,random,Seeded random mixed workload (1020),2026-09-20,1020
+random_1021,random,Seeded random mixed workload (1021),2026-09-20,1021
+random_1022,random,Seeded random mixed workload (1022),2026-09-20,1022
+random_1023,random,Seeded random mixed workload (1023),2026-09-20,1023
+random_1024,random,Seeded random mixed workload (1024),2026-09-20,1024
+random_1025,random,Seeded random mixed workload (1025),2026-09-20,1025

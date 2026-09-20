@@ -80,16 +80,14 @@ class PlanningItemSerializer(serializers.ModelSerializer):
         model = PlanningItem
         fields = [
             'id', 'parent', 'item_type', 'title', 'description', 'sibling_order',
-            'start_date', 'due_date', 'scheduled_date', 'manual_requested_date',
-            'duration_category', 'percent_completed',
+            'start_date', 'due_date', 'scheduled_date', 'duration_category',
             'priority_position', 'is_completed', 'has_deadline',
             'canvas_object_type', 'canvas_object_id',
             'tags', 'tag_ids', 'assignment_detail',
             'created_at', 'updated_at',
         ]
         read_only_fields = [
-            'priority_position', 'scheduled_date', 'manual_requested_date',
-            'percent_completed', 'canvas_object_type',
+            'priority_position', 'scheduled_date', 'canvas_object_type',
             'canvas_object_id', 'created_at', 'updated_at',
         ]
 
@@ -133,37 +131,12 @@ class PlanningItemSerializer(serializers.ModelSerializer):
         user = validated_data.pop('user')
 
         parent = validated_data.get('parent')
-
-        # Frozen ARC creation semantics:
-        # Parent temporal values are CREATE-TIME DEFAULTS, not permanent
-        # inherited constraints. Explicit child values always win.
-        if parent is not None:
-            if 'start_date' not in validated_data:
-                validated_data['start_date'] = parent.start_date
-            if 'due_date' not in validated_data:
-                validated_data['due_date'] = parent.due_date
-
-            # If an executable anchored parent becomes structural, preserve
-            # the parent's canonical anchor and let the newly required child
-            # inherit that date intent.
-            if (
-                'manual_requested_date' not in validated_data
-                and parent.manual_requested_date is not None
-            ):
-                validated_data['manual_requested_date'] = parent.manual_requested_date
-
         validated_data.setdefault(
             'sibling_order',
             PlanningItem.objects.filter(user=user, parent=parent).count() + 1,
         )
 
         item = PlanningItem.objects.create(user=user, **validated_data)
-
-        # Adding unfinished required work means a previously-completed parent
-        # is no longer semantically complete.
-        if parent is not None and not item.is_completed and parent.is_completed:
-            parent.is_completed = False
-            parent.save(update_fields=['is_completed'])
 
         if detail:
             AssignmentDetail.objects.create(planning_item=item, **detail)

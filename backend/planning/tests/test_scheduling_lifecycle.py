@@ -5,7 +5,7 @@ import pytest
 from freezegun import freeze_time
 
 from planning.models import ItemType, PlanningHistoryEntry, PlanningItem, SchedulingPreference, SchedulingState
-from planning.services import history, priority, scheduling
+from planning.services import history, priority, scheduling, hierarchy
 
 pytestmark = pytest.mark.django_db
 TODAY = date(2026, 9, 14)
@@ -170,20 +170,20 @@ def test_global_empty_capacity_moves_forward_and_release_is_hard(user, make_item
 # Scheduler eligibility invariant
 # --------------------------------------------------------------------------
 
-def test_global_schedule_includes_actionable_parents_with_children(user, make_item):
-    """Children affect priority-frontier membership, not schedulability."""
+def test_global_schedule_excludes_parent_with_unfinished_children(user, make_item):
+    """Only execution-frontier work receives an execution date."""
     assignment = make_item(user, 'Parent assignment', ItemType.ASSIGNMENT)
     child = make_item(user, 'Child task', parent=assignment)
 
     scheduling.schedule(user, mode='global')
     refresh(assignment, child)
 
-    assert assignment.scheduled_date is not None
+    assert assignment.scheduled_date is None
     assert child.scheduled_date is not None
 
 
-def test_global_schedule_gives_every_actionable_item_an_execution_date(user, make_item):
-    """Global scheduling must never leave active actionable work unscheduled."""
+def test_global_schedule_gives_every_frontier_item_an_execution_date(user, make_item):
+    """Global scheduling schedules active frontier work, not decomposed parents."""
     assignment = make_item(user, 'Assignment', ItemType.ASSIGNMENT)
     task = make_item(user, 'Task')
     nested = make_item(user, 'Nested task', parent=assignment)
@@ -191,9 +191,26 @@ def test_global_schedule_gives_every_actionable_item_an_execution_date(user, mak
     scheduling.schedule(user, mode='global')
     refresh(assignment, task, nested)
 
-    assert assignment.scheduled_date is not None
+    assert assignment.scheduled_date is None
     assert task.scheduled_date is not None
     assert nested.scheduled_date is not None
+
+
+def test_completed_children_expose_parent_to_scheduler(user, make_item):
+    """A parent becomes schedulable once no unfinished children remain."""
+    assignment = make_item(user, 'Parent assignment', ItemType.ASSIGNMENT)
+    child = make_item(
+        user,
+        'Completed child',
+        parent=assignment,
+        is_completed=True,
+    )
+
+    scheduling.schedule(user, mode='global')
+    refresh(assignment, child)
+
+    assert assignment.scheduled_date is not None
+
 
 
 def test_goal_remains_outside_scheduler_eligibility(user, make_item):
@@ -207,8 +224,8 @@ def test_goal_remains_outside_scheduler_eligibility(user, make_item):
     assert goal.scheduled_date is None
 
 
-def test_parent_remains_outside_priority_frontier_but_inside_scheduler(user, make_item):
-    """Priority eligibility and scheduling eligibility are intentionally distinct."""
+def test_parent_outside_priority_frontier_is_also_outside_scheduler(user, make_item):
+    """Decomposed parents belong to neither execution nor priority frontier."""
     assignment = make_item(user, 'Parent assignment', ItemType.ASSIGNMENT)
     make_item(user, 'Child task', parent=assignment)
 
@@ -221,4 +238,203 @@ def test_parent_remains_outside_priority_frontier_but_inside_scheduler(user, mak
     scheduling.schedule(user, mode='global')
     assignment.refresh_from_db()
 
-    assert assignment.scheduled_date is not None
+    assert assignment.scheduled_date is None
+
+
+def test_global_reschedule_clears_parent_date_when_child_reopens(user, make_item):
+    """Reopening a child demotes its parent and clears stale automatic execution."""
+    parent = make_item(user, 'Report', ItemType.ASSIGNMENT)
+    child = make_item(user, 'Draft', parent=parent, is_completed=True)
+
+    scheduling.schedule(user, mode='global')
+    parent.refresh_from_db()
+    assert parent.scheduled_date is not None
+
+    child.is_completed = False
+    child.save(update_fields=['is_completed'])
+
+    scheduling.schedule(user, mode='global')
+    refresh(parent, child)
+
+    assert parent.scheduled_date is None
+    assert child.scheduled_date is not None
+
+
+def test_global_reschedule_clears_parent_date_when_child_added(user, make_item):
+    """Adding unfinished child work demotes an already scheduled parent."""
+    parent = make_item(user, 'Submit project', ItemType.ASSIGNMENT)
+
+    scheduling.schedule(user, mode='global')
+    parent.refresh_from_db()
+    assert parent.scheduled_date is not None
+
+    child = make_item(user, 'Final review', parent=parent)
+
+    scheduling.schedule(user, mode='global')
+    refresh(parent, child)
+
+    assert parent.scheduled_date is None
+    assert child.scheduled_date is not None
+
+
+def test_anchored_parent_loses_execution_anchor_when_child_added(user, make_item):
+    parent = make_item(user, 'Anchored parent', ItemType.ASSIGNMENT)
+
+    scheduling.schedule(user, mode='global')
+    parent.refresh_from_db()
+
+    parent.schedule_is_manual = True
+    parent.save(update_fields=['schedule_is_manual'])
+
+    make_item(user, 'New child', parent=parent)
+
+    scheduling.schedule(user, mode='global')
+    parent.refresh_from_db()
+
+    assert parent.scheduled_date is None
+    assert parent.schedule_is_manual is False
+
+
+def test_anchored_parent_loses_execution_anchor_when_child_reopens(user, make_item):
+    parent = make_item(user, 'Anchored parent', ItemType.ASSIGNMENT)
+    child = make_item(user, 'Child', parent=parent, is_completed=True)
+
+    scheduling.schedule(user, mode='global')
+    parent.refresh_from_db()
+
+    parent.schedule_is_manual = True
+    parent.save(update_fields=['schedule_is_manual'])
+
+    hierarchy.reopen(child)
+
+    parent.refresh_from_db()
+    child.refresh_from_db()
+
+    assert parent.scheduled_date is None
+    assert parent.schedule_is_manual is False
+    assert child.scheduled_date is not None
+
+
+def test_anchored_parent_loses_execution_anchor_when_child_restored(user, make_item):
+    parent = make_item(user, 'Anchored parent', ItemType.ASSIGNMENT)
+    child = make_item(user, 'Child', parent=parent)
+    child.is_deleted = True
+    child.save(update_fields=['is_deleted'])
+
+    scheduling.schedule(user, mode='global')
+    parent.refresh_from_db()
+
+    parent.schedule_is_manual = True
+    parent.save(update_fields=['schedule_is_manual'])
+
+    child.is_deleted = False
+    child.save(update_fields=['is_deleted'])
+
+    scheduling.schedule(user, mode='global')
+    parent.refresh_from_db()
+    child.refresh_from_db()
+
+    assert parent.scheduled_date is None
+    assert parent.schedule_is_manual is False
+    assert child.scheduled_date is not None
+
+
+def test_moving_child_under_anchored_parent_invalidates_parent_anchor(user, make_item):
+    source = make_item(user, 'Source', ItemType.ASSIGNMENT)
+    target = make_item(user, 'Anchored target', ItemType.ASSIGNMENT)
+    child = make_item(user, 'Moving child', parent=source)
+
+    scheduling.schedule(user, mode='global')
+    target.refresh_from_db()
+
+    target.schedule_is_manual = True
+    target.save(update_fields=['schedule_is_manual'])
+
+    hierarchy.set_parent(child, target)
+
+    target.refresh_from_db()
+    child.refresh_from_db()
+
+    assert target.scheduled_date is None
+    assert target.schedule_is_manual is False
+    assert child.scheduled_date is not None
+
+
+def test_daily_schedule_expires_past_manual_anchor(user, make_item):
+    today = date(2026, 9, 20)
+
+    item = make_item(
+        user,
+        'Expired anchor',
+        scheduled_date=today - timedelta(days=1),
+        schedule_is_manual=True,
+        due_date=today + timedelta(days=10),
+    )
+
+    result = scheduling.daily_schedule(user, today=today)
+
+    item.refresh_from_db()
+
+    assert item.schedule_is_manual is False
+    assert item.pk in result['expired_anchor_ids']
+    assert item.due_date == today + timedelta(days=10)
+    assert item.scheduled_date >= today
+
+
+def test_anchor_today_does_not_expire(user, make_item):
+    today = date(2026, 9, 20)
+
+    item = make_item(
+        user,
+        'Anchor today',
+        scheduled_date=today,
+        schedule_is_manual=True,
+        due_date=today + timedelta(days=10),
+    )
+
+    result = scheduling.daily_schedule(user, today=today)
+
+    item.refresh_from_db()
+
+    assert item.schedule_is_manual is True
+    assert item.scheduled_date == today
+    assert item.pk not in result['expired_anchor_ids']
+
+
+def test_future_anchor_does_not_expire(user, make_item):
+    today = date(2026, 9, 20)
+
+    item = make_item(
+        user,
+        'Future anchor',
+        scheduled_date=today + timedelta(days=3),
+        schedule_is_manual=True,
+        due_date=today + timedelta(days=10),
+    )
+
+    scheduling.daily_schedule(user, today=today)
+
+    item.refresh_from_db()
+
+    assert item.schedule_is_manual is True
+    assert item.scheduled_date == today + timedelta(days=3)
+
+
+def test_expired_anchor_does_not_create_overdue_semantics(user, make_item):
+    today = date(2026, 9, 20)
+
+    item = make_item(
+        user,
+        'Expired preference but live deadline',
+        scheduled_date=today - timedelta(days=3),
+        schedule_is_manual=True,
+        due_date=today + timedelta(days=7),
+    )
+
+    scheduling.daily_schedule(user, today=today)
+
+    item.refresh_from_db()
+
+    assert item.schedule_is_manual is False
+    assert item.due_date == today + timedelta(days=7)
+    assert item.scheduled_date >= today

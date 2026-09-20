@@ -276,3 +276,54 @@ def test_another_users_schedule_is_untouched(user, other_user, make_item):
 @freeze_time(FROZEN)
 def test_a_user_with_nothing_to_schedule_is_a_no_op(user):
     assert scheduling.roll_forward_adaptive(user, TODAY) == []
+
+
+def test_scheduler_does_not_schedule_parent_with_unfinished_child(user):
+    """Decomposed parents are not execution-schedulable."""
+    from planning.models import PlanningItem
+    from planning.services.scheduling import schedule
+
+    parent = PlanningItem.objects.create(
+        user=user,
+        title="Assignment 2",
+        item_type="ASSIGNMENT",
+    )
+    child = PlanningItem.objects.create(
+        user=user,
+        title="Implement scheduler",
+        item_type="TASK",
+        parent=parent,
+    )
+
+    schedule(user)
+
+    parent.refresh_from_db()
+    child.refresh_from_db()
+
+    assert parent.scheduled_date is None
+    assert child.scheduled_date is not None
+
+
+def test_parent_becomes_schedulable_when_children_complete(user):
+    """Completing the frontier exposes its parent as the new frontier."""
+    from planning.models import PlanningItem
+    from planning.services.scheduling import schedule
+
+    parent = PlanningItem.objects.create(
+        user=user,
+        title="Assignment 2",
+        item_type="ASSIGNMENT",
+    )
+    child = PlanningItem.objects.create(
+        user=user,
+        title="Implement scheduler",
+        item_type="TASK",
+        parent=parent,
+        is_completed=True,
+    )
+
+    schedule(user)
+
+    parent.refresh_from_db()
+
+    assert parent.scheduled_date is not None

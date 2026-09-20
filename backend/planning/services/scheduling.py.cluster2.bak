@@ -1,22 +1,12 @@
 """Global, capacity-constrained execution dates and atomic Timeline operations."""
 from collections import Counter
 from datetime import timedelta
-from decimal import Decimal
 
-from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
-from planning.models import (
-    DurationCategory,
-    PlanningItem,
-    ProgressSegment,
-    SchedulingOverload,
-    SchedulingPreference,
-    SchedulingState,
-    SPLITTABLE_DURATION_CATEGORIES,
-)
+from planning.models import DurationCategory, PlanningItem, SchedulingOverload, SchedulingPreference, SchedulingState
 from planning.services import history, leaf_order_sync, priority
 
 BUCKET_FIELDS = {
@@ -159,26 +149,14 @@ def schedule(user, today=None, *, mode='minimal'):
             if item.start_date and item.start_date > item.due_date:
                 conflicts.append(_conflict(item, 'before_start'))
             continue
-        # Canonical anchor/manual date intent has authority over disposable
-        # scheduler proposals. Legacy schedule_is_manual remains supported
-        # while old API paths are migrated.
-        anchored_day = item.manual_requested_date
-        legacy_manual_day = (
-            item.scheduled_date
-            if item.schedule_is_manual and item.scheduled_date
-            else None
-        )
-        manual_day = anchored_day or legacy_manual_day
-
-        if manual_day:
-            day = manual_day
+        if item.schedule_is_manual and item.scheduled_date:
+            day = item.scheduled_date
             code = _validate_date(item, day, today)
             if code:
                 conflicts.append(_conflict(item, code))
             if usage[(day, bucket)] >= limits[bucket] and day not in overloaded:
                 conflicts.append(_conflict(item, 'capacity_exceeded'))
             usage[(day, bucket)] += 1
-            assign(item, day)
         else:
             pending.append(item)
 
@@ -208,30 +186,23 @@ def schedule(user, today=None, *, mode='minimal'):
         assign(item, day)
     if changed:
         PlanningItem.objects.bulk_update(changed, ['scheduled_date'])
-
-    # Proposed allocations are disposable scheduler output. Rebuild only the
-    # unconfirmed projections; confirmed segments remain canonical progress.
-    _reconcile_progress_allocations(user, today)
-
-    # Canonical 100% progress and completion must never diverge.
-    reconcile_progress(user)
-
     return {'changed_ids': [item.pk for item in changed], 'conflicts': conflicts}
 
 
 def _expire_past_manual_anchors(user, today):
-    """Expire past canonical anchors without manufacturing deadline overdue.
+    """Return expired manual anchors to automatic scheduling control.
 
-    The hard date commitment disappears once missed. The factual due date is
-    untouched. The history layer remains available as the durable record of
-    explicit planning actions.
+    A manual scheduled date is a user placement preference, not a deadline.
+    Once that date is in the past for unfinished active work, the anchor
+    expires. The factual due_date is deliberately untouched.
     """
     expired = list(
         PlanningItem.objects.for_user(user)
         .filter(
             is_completed=False,
             is_deleted=False,
-            manual_requested_date__lt=today,
+            schedule_is_manual=True,
+            scheduled_date__lt=today,
         )
     )
 
@@ -239,13 +210,9 @@ def _expire_past_manual_anchors(user, today):
         return []
 
     for item in expired:
-        item.manual_requested_date = None
         item.schedule_is_manual = False
 
-    PlanningItem.objects.bulk_update(
-        expired,
-        ['manual_requested_date', 'schedule_is_manual'],
-    )
+    PlanningItem.objects.bulk_update(expired, ['schedule_is_manual'])
     return [item.pk for item in expired]
 
 
@@ -385,181 +352,3 @@ def configure(user, *, capacity=None, day=None, overloaded=None, today=None):
     if day is not None:
         SchedulingOverload.objects.update_or_create(user=user, date=day, defaults={'allowed': overloaded})
     return _finish(user, before, today, baseline)
-
-
-# ---------------------------------------------------------------------------
-# Frozen ARC anchor/manual-intent commands
-# ---------------------------------------------------------------------------
-
-@transaction.atomic
-def set_anchor(
-    item: PlanningItem,
-    day,
-    *,
-    change_deadline=False,
-    change_release=False,
-    allow_overload=False,
-):
-    """Set canonical explicit date intent.
-
-    Crossing release/deadline boundaries is never silently repaired. The
-    caller must explicitly authorize the corresponding canonical date change.
-    """
-    item = PlanningItem.objects.select_for_update().get(pk=item.pk)
-
-    if item.is_deleted or item.is_completed:
-        raise ValidationError("Only active unfinished work can be anchored.")
-
-    if item.due_date and day > item.due_date:
-        if not change_deadline:
-            raise ValidationError(
-                {"anchor": "Anchor is after deadline; explicitly extend the deadline or cancel."}
-            )
-        item.due_date = day
-
-    if item.start_date and day < item.start_date:
-        if not change_release:
-            raise ValidationError(
-                {"anchor": "Anchor is before release; explicitly move the release or cancel."}
-            )
-        item.start_date = day
-
-    item.manual_requested_date = day
-
-    fields = ["manual_requested_date"]
-    if change_deadline:
-        fields.append("due_date")
-    if change_release:
-        fields.append("start_date")
-
-    item.save(update_fields=fields)
-
-    if allow_overload:
-        SchedulingOverload.objects.update_or_create(
-            user=item.user,
-            date=day,
-            defaults={"allowed": True},
-        )
-
-    schedule(item.user)
-    item.refresh_from_db()
-    return item
-
-
-anchor = set_anchor
-set_manual_requested_date = set_anchor
-request_date = set_anchor
-
-
-@transaction.atomic
-def remove_anchor(item: PlanningItem):
-    """Explicitly return placement authority to automatic scheduling."""
-    item = PlanningItem.objects.select_for_update().get(pk=item.pk)
-    item.manual_requested_date = None
-    item.schedule_is_manual = False
-    item.save(update_fields=["manual_requested_date", "schedule_is_manual"])
-    schedule(item.user)
-    item.refresh_from_db()
-    return item
-
-
-unanchor = remove_anchor
-clear_anchor = remove_anchor
-clear_manual_requested_date = remove_anchor
-
-
-def validate_anchor(item: PlanningItem, day):
-    """Return canonical conflicts without mutating state."""
-    conflicts = []
-    if item.start_date and day < item.start_date:
-        conflicts.append("before_release")
-    if item.due_date and day > item.due_date:
-        conflicts.append("after_deadline")
-    return conflicts
-
-
-def reconcile_anchors(user, today=None):
-    """Time reconciliation for expired explicit date intent."""
-    today = today or timezone.localdate()
-    expired = _expire_past_manual_anchors(user, today)
-    result = schedule(user, today)
-    result["expired_anchor_ids"] = expired
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Frozen ARC splittable-work allocation bridge
-# ---------------------------------------------------------------------------
-
-_SPLITTABLE_VALUES = {
-    value.value if hasattr(value, "value") else str(value)
-    for value in SPLITTABLE_DURATION_CATEGORIES
-}
-
-
-def _allocation_count(category):
-    """Session count is scheduler policy, not canonical task identity.
-
-    This baseline merely guarantees genuine splitting for splittable classes;
-    later arena algorithms are free to replace these proposal sizes.
-    """
-    if category == DurationCategory.OVER_16_HOURS:
-        return 3
-    return 2
-
-
-def _reconcile_progress_allocations(user, today=None):
-    today = today or timezone.localdate()
-
-    candidates = list(_scheduler_eligible(user))
-
-    candidate_ids = {item.pk for item in candidates}
-
-    # Proposed segments are disposable. Confirmed segments are durable.
-    ProgressSegment.objects.filter(
-        item__user=user,
-        is_completed=False,
-    ).delete()
-
-    for item in candidates:
-        if item.duration_category not in _SPLITTABLE_VALUES:
-            continue
-
-        remaining = Decimal("100") - Decimal(str(item.percent_completed))
-        if remaining <= 0:
-            continue
-
-        count = _allocation_count(item.duration_category)
-        base = (remaining / count).quantize(Decimal("0.01"))
-        pieces = [base] * count
-        pieces[-1] += remaining - sum(pieces)
-
-        first_day = item.scheduled_date or max(today, item.start_date or today)
-
-        ProgressSegment.objects.bulk_create(
-            [
-                ProgressSegment(
-                    item=item,
-                    percentage=percentage,
-                    scheduled_date=first_day + timedelta(days=index),
-                    is_completed=False,
-                )
-                for index, percentage in enumerate(pieces)
-                if percentage > 0
-            ]
-        )
-
-
-# Re-export progress lifecycle commands through scheduling because scheduling
-# is the primary domain façade consumed by Timeline/Focus and contract tests.
-from planning.services.progress import (  # noqa: E402
-    complete_segment,
-    reopen_segment,
-    reconcile_progress,
-)
-
-complete_allocation = complete_segment
-confirm_progress = complete_segment
-record_completed_allocation = complete_segment
-uncomplete_segment = reopen_segment
-reverse_progress_segment = reopen_segment
