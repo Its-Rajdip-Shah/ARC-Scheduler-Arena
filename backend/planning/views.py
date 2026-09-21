@@ -35,7 +35,6 @@ from planning.serializers import (
     ScheduleMoveSerializer,
     ScheduleResultSerializer,
     ScheduleReplaceSerializer,
-    ScheduleCapacitySerializer,
     ScheduleOverloadSerializer,
     CompleteSerializer,
     MarkGroupSerializer,
@@ -52,7 +51,7 @@ from planning.serializers import (
     TimezoneSerializer,
 )
 from planning.services import hierarchy, leaf_order_sync, overdue, priority, scheduling
-from planning.services import history
+from planning.services import deletion, history
 
 
 def _as_400(exc):
@@ -185,11 +184,12 @@ class PlanningItemViewSet(UserScopedMixin, viewsets.ModelViewSet):
         # Creating an item may change the global priority ordering.
         priority_before = history.capture_priority(self.request.user, include_unpositioned=True)
 
+        items_before = history.capture_items(self.request.user, PlanningItem.objects.filter(user=self.request.user).values_list("pk", flat=True))
         instance = serializer.save(user=self.request.user)
 
         item_after = history.capture_items(
             self.request.user,
-            [instance.pk],
+            PlanningItem.objects.filter(user=self.request.user).values_list("pk", flat=True),
         )
         priority_after = history.capture_priority(self.request.user, include_unpositioned=True)
 
@@ -198,6 +198,7 @@ class PlanningItemViewSet(UserScopedMixin, viewsets.ModelViewSet):
             'CREATE',
             {
                 'delete_ids': [instance.pk],
+                'items': items_before,
                 'priority': priority_before,
             },
             {
@@ -212,14 +213,14 @@ class PlanningItemViewSet(UserScopedMixin, viewsets.ModelViewSet):
 
         before = history.capture_items(
             self.request.user,
-            [instance.pk],
+            PlanningItem.objects.filter(user=self.request.user).values_list("pk", flat=True),
         )
 
         updated = serializer.save()
 
         after = history.capture_items(
             self.request.user,
-            [updated.pk],
+            PlanningItem.objects.filter(user=self.request.user).values_list("pk", flat=True),
         )
 
         history.record_checkpoint(
@@ -244,17 +245,10 @@ class PlanningItemViewSet(UserScopedMixin, viewsets.ModelViewSet):
         siblings_before = history.capture_siblings(user, parent_id)
         priority_before = history.capture_priority(user, include_unpositioned=True)
 
-        # The original rows, PKs, hierarchy, tags and assignment details
-        # remain intact while DELETE is undoable.
-        PlanningItem.objects.filter(
-            user=user,
-            pk__in=subtree_ids,
-        ).update(is_deleted=True)
-
-        # Deleting a child can make its parent priority-eligible.
-        scheduling.schedule(user)
-
-        hierarchy.reindex_siblings(user, parent)
+        # HTTP DELETE crosses the same validated lifecycle boundary as every
+        # other ARC caller.  The service owns dependency suspension, durable
+        # restoration context, priority/frontier reconciliation and scheduling.
+        deletion.delete_subtree(instance)
 
         siblings_after = history.capture_siblings(user, parent_id)
         priority_after = history.capture_priority(user, include_unpositioned=True)
@@ -345,20 +339,7 @@ class PlanningItemViewSet(UserScopedMixin, viewsets.ModelViewSet):
 
         order = serializer.validated_data.get('sibling_order')
         if order is not None:
-            siblings = list(
-                hierarchy._siblings(request.user, item.parent)
-                .exclude(pk=item.pk)
-            )
-
-            # Insert the moved item at the requested 1-based position.
-            index = max(0, min(order - 1, len(siblings)))
-            siblings.insert(index, item)
-
-            # Persist the resulting sibling order explicitly.
-            for sibling_order, sibling in enumerate(siblings, start=1):
-                if sibling.sibling_order != sibling_order:
-                    sibling.sibling_order = sibling_order
-                    sibling.save(update_fields=['sibling_order'])
+            item = hierarchy.set_sibling_order(item, order)
 
         leaf_order_sync.from_planner(item)
         scheduling.schedule(request.user)
@@ -789,22 +770,6 @@ class ScheduleReplaceView(APIView):
         serializer.is_valid(raise_exception=True)
         try:
             result = scheduling.replace(request.user, **serializer.validated_data)
-        except scheduling.SchedulingConflict as exc:
-            return Response({'conflicts': exc.conflicts}, status=409)
-        return Response(result)
-
-
-class ScheduleCapacityView(APIView):
-    @extend_schema(responses=serializers.DictField(child=serializers.IntegerField()))
-    def get(self, request):
-        return Response(scheduling.capacities(request.user))
-
-    @extend_schema(request=ScheduleCapacitySerializer, responses={200: ScheduleResultSerializer, 409: ScheduleResultSerializer})
-    def patch(self, request):
-        serializer = ScheduleCapacitySerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        try:
-            result = scheduling.configure(request.user, capacity=serializer.validated_data)
         except scheduling.SchedulingConflict as exc:
             return Response({'conflicts': exc.conflicts}, status=409)
         return Response(result)

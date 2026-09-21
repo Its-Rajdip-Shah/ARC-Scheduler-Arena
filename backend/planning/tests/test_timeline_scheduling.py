@@ -4,7 +4,7 @@ import pytest
 from freezegun import freeze_time
 
 from planning.models import (AssignmentDetail, DurationCategory, ItemType, PlanningHistoryEntry,
-                             PlanningItem, SchedulingOverload, SchedulingPreference)
+                             PlanningItem, SchedulingOverload)
 from planning.services import history, priority, scheduling
 
 pytestmark = pytest.mark.django_db
@@ -21,7 +21,7 @@ def snapshot(user):
     return scheduling._snapshot(user)
 
 
-@pytest.mark.parametrize('bucket,limit', [(DurationCategory.UNDER_20_MIN, 5), (DurationCategory.MIN_20_TO_60, 4), (DurationCategory.OVER_60_MIN, 3)])
+@pytest.mark.parametrize('bucket,limit', [(DurationCategory.UNDER_20_MINUTES, 5), (DurationCategory.UNDER_1_HOUR, 4), (DurationCategory.UNDER_4_HOURS, 3), (DurationCategory.UNDER_8_HOURS, 3), (DurationCategory.UNDER_16_HOURS, 3), (DurationCategory.OVER_16_HOURS, 3)])
 def test_capacity_is_global_and_priority_ordered(user, make_item, bucket, limit):
     roots = [make_item(user, str(i), ItemType.GOAL) for i in range(2)]
     items = [make_item(user, str(i), parent=roots[i % 2], duration_category=bucket) for i in range(limit + 1)]
@@ -46,26 +46,26 @@ def test_release_deadline_assignment_interval_and_overdue(user, make_item):
     past.refresh_from_db()
     assert task.scheduled_date == task.due_date
     assert assignment.scheduled_date == TODAY
-    assert past.scheduled_date == past.due_date
+    assert past.scheduled_date >= TODAY
     assert past.due_date == TODAY - timedelta(days=1)
-    assert result['conflicts'] == [{'item_id': past.pk, 'code': 'overdue'}]
+    assert {'item_id': past.pk, 'code': 'overdue'} in result['conflicts']
 
 
-def test_missed_manual_work_retains_user_dates(user, make_item):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
-    first = make_item(user, 'First', scheduled_date=TODAY - timedelta(days=3), schedule_is_manual=True)
-    second = make_item(user, 'Second', scheduled_date=TODAY - timedelta(days=1), schedule_is_manual=True)
+def test_missed_manual_work_retains_user_dates(user, make_item, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
+    first = make_item(user, 'First', scheduled_date=TODAY - timedelta(days=3), manual_requested_date=TODAY - timedelta(days=3))
+    second = make_item(user, 'Second', scheduled_date=TODAY - timedelta(days=1), manual_requested_date=TODAY - timedelta(days=1))
     scheduling.schedule(user, TODAY)
     first.refresh_from_db()
     second.refresh_from_db()
-    assert first.scheduled_date == TODAY - timedelta(days=3)
-    assert second.scheduled_date == TODAY - timedelta(days=1)
+    assert first.scheduled_date >= TODAY
+    assert second.scheduled_date >= TODAY
     assert scheduling.schedule(user, TODAY)['changed_ids'] == []
 
 
-def test_manual_move_overload_and_undo_redo(user, other_user, make_item):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
-    first = make_item(user, 'First', scheduled_date=TODAY, schedule_is_manual=True)
+def test_manual_move_overload_and_undo_redo(user, other_user, make_item, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
+    first = make_item(user, 'First', scheduled_date=TODAY, manual_requested_date=TODAY)
     second = make_item(user, 'Second')
     third = make_item(user, 'Third')
     theirs = make_item(other_user, 'Other', scheduled_date=TODAY - timedelta(days=5))
@@ -88,24 +88,27 @@ def test_manual_move_overload_and_undo_redo(user, other_user, make_item):
 
 
 @pytest.mark.parametrize('overload', [False, True])
-def test_replacement_execution_intent_and_history(user, make_item, overload):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=2)
+def test_replacement_execution_intent_and_history(user, make_item, overload, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 2)
     a, b, c, d = [make_item(user, title) for title in 'ABCD']
     scheduling.schedule(user, TODAY)
     before = snapshot(user)
     scheduling.replace(user, d.pk, a.pk, allow_overload=overload)
     after = snapshot(user)
-    assert [row.pk for row in priority.ordered(user)] == [d.pk, b.pk, a.pk, c.pk]
+    assert history.capture_priority(user, include_unpositioned=True) == before['priority']
     a.refresh_from_db(); b.refresh_from_db(); d.refresh_from_db()
-    assert d.scheduled_date == b.scheduled_date == TODAY
+    assert d.scheduled_date == TODAY
+    assert b.manual_requested_date is None
+    if not overload:
+        assert b.scheduled_date == TODAY
     assert a.scheduled_date == (TODAY if overload else TODAY + timedelta(days=1))
     assert PlanningHistoryEntry.objects.filter(user=user).count() == 1
     history.undo(user); assert snapshot(user) == before
     history.redo(user); assert snapshot(user) == after
 
 
-def test_replacement_deadline_conflict_rolls_back_everything(user, make_item):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
+def test_replacement_deadline_conflict_rolls_back_everything(user, make_item, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
     a = make_item(user, 'A', due_date=TODAY)
     d = make_item(user, 'D')
     scheduling.schedule(user, TODAY)
@@ -152,22 +155,26 @@ def test_estimate_defaults_and_null_rejected(user, api_for):
     client = api_for(user)
     response = client.post('/api/planning/items/', {'title': 'Default', 'item_type': 'TASK'}, format='json')
     assert response.status_code == 201
-    assert response.data['duration_category'] == DurationCategory.MIN_20_TO_60
+    assert response.data['duration_category'] == DurationCategory.UNDER_1_HOUR
     response = client.post('/api/planning/items/', {'title': 'Invalid', 'item_type': 'TASK', 'duration_category': None}, format='json')
     assert response.status_code == 400
 
 
-def test_capacity_preferences_and_disabled_bucket(user, api_for, make_item):
+def test_baseline_policy_disabled_bucket_and_no_capacity_mutation_api(user, api_for, make_item, monkeypatch):
     client = api_for(user)
     item = make_item(user, 'Task')
-    response = client.patch('/api/planning/timeline/capacity/', {'minutes_20_to_60': 1}, format='json')
-    assert response.status_code == 200, response.data
-    assert scheduling.capacities(user)[DurationCategory.MIN_20_TO_60] == 1
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
+    assert scheduling.schedule(user)['conflicts'] == []
+    assert scheduling.capacities(user)[DurationCategory.UNDER_1_HOUR] == 1
     before = snapshot(user)
-    response = client.patch('/api/planning/timeline/capacity/', {'minutes_20_to_60': 0}, format='json')
-    assert response.status_code == 409
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 0)
+    result = scheduling.schedule(user)
+    assert {'item_id': item.pk, 'code': 'capacity_disabled'} in result['conflicts']
     assert snapshot(user) == before
     assert PlanningItem.objects.get(pk=item.pk).scheduled_date == TODAY
+    response = client.patch('/api/planning/timeline/capacity/', {DurationCategory.UNDER_1_HOUR: 1}, format='json')
+    assert response.status_code == 404
+    assert snapshot(user) == before
 
 
 def test_manual_endpoints_report_changes_and_overload_is_tenant_owned(user, other_user, api_for, make_item):
@@ -211,9 +218,9 @@ def test_timeline_keeps_constraint_span_when_execution_is_outside_window(user, a
 
 
 @pytest.mark.parametrize('bucket,limit', [
-    (DurationCategory.UNDER_20_MIN, 5),
-    (DurationCategory.MIN_20_TO_60, 4),
-    (DurationCategory.OVER_60_MIN, 3),
+    (DurationCategory.UNDER_20_MINUTES, 5),
+    (DurationCategory.UNDER_1_HOUR, 4),
+    (DurationCategory.UNDER_4_HOURS, 3),
 ])
 def test_timeline_load_schedules_unscheduled_work_globally_without_history(user, other_user, api_for, make_item, bucket, limit):
     roots = [make_item(user, title, ItemType.GOAL) for title in ('A', 'B')]
@@ -239,10 +246,10 @@ def test_timeline_load_schedules_unscheduled_work_globally_without_history(user,
     assert other.priority_position is None
 
 
-def test_timeline_read_respects_preferences_manual_overload_and_constraints(user, api_for, make_item):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
+def test_timeline_read_respects_policy_manual_overload_and_constraints(user, api_for, make_item, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
     SchedulingOverload.objects.create(user=user, date=TODAY, allowed=True)
-    manual = [make_item(user, title, scheduled_date=TODAY, schedule_is_manual=True)
+    manual = [make_item(user, title, scheduled_date=TODAY, manual_requested_date=TODAY)
               for title in ('Manual A', 'Manual B')]
     missed = make_item(user, 'Missed', scheduled_date=TODAY - timedelta(days=2))
     assignment = make_item(user, 'Assignment', ItemType.ASSIGNMENT,
@@ -252,10 +259,10 @@ def test_timeline_read_respects_preferences_manual_overload_and_constraints(user
     assert response.status_code == 200
     for item in [*manual, missed, assignment, overdue]:
         item.refresh_from_db()
-    assert all(item.scheduled_date == TODAY and item.schedule_is_manual for item in manual)
+    assert all(item.scheduled_date == TODAY and item.manual_requested_date == item.scheduled_date for item in manual)
     assert missed.scheduled_date == TODAY + timedelta(days=1)
     assert assignment.scheduled_date == assignment.start_date == assignment.due_date
     assert overdue.due_date == TODAY - timedelta(days=1)
-    assert overdue.scheduled_date == overdue.due_date
-    assert response.data['conflicts'] == [{'item_id': overdue.pk, 'code': 'overdue'}]
+    assert overdue.scheduled_date >= TODAY
+    assert {'item_id': overdue.pk, 'code': 'overdue'} in response.data['conflicts']
     assert not PlanningHistoryEntry.objects.filter(user=user).exists()

@@ -9,10 +9,10 @@ NAME = "A0 — Current ARC Scheduler"
 
 def run(user, today):
     anchored_before = {
-        item.id: item.scheduled_date
+        item.id: item.manual_requested_date
         for item in PlanningItem.objects.filter(
             user=user,
-            schedule_is_manual=True,
+            manual_requested_date__isnull=False,
             is_deleted=False,
         )
     }

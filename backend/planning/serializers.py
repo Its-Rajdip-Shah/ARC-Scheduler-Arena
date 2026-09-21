@@ -80,7 +80,7 @@ class PlanningItemSerializer(serializers.ModelSerializer):
         model = PlanningItem
         fields = [
             'id', 'parent', 'item_type', 'title', 'description', 'sibling_order',
-            'start_date', 'due_date', 'scheduled_date', 'manual_requested_date',
+            'start_date', 'due_date', 'scheduled_date', 'execution_rank', 'manual_requested_date',
             'duration_category', 'percent_completed',
             'priority_position', 'is_completed', 'has_deadline',
             'canvas_object_type', 'canvas_object_id',
@@ -88,7 +88,7 @@ class PlanningItemSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at',
         ]
         read_only_fields = [
-            'priority_position', 'scheduled_date', 'manual_requested_date',
+            'priority_position', 'scheduled_date', 'execution_rank', 'manual_requested_date',
             'percent_completed', 'canvas_object_type',
             'canvas_object_id', 'created_at', 'updated_at',
         ]
@@ -126,107 +126,31 @@ class PlanningItemSerializer(serializers.ModelSerializer):
         return value
 
     def create(self, validated_data):
-        from planning.services import priority, scheduling
-
+        from planning.services import domain_commands
         detail = validated_data.pop('assignment_detail', None)
         tags = validated_data.pop('tags', None)
         user = validated_data.pop('user')
-
-        parent = validated_data.get('parent')
-
-        # Frozen ARC creation semantics:
-        # Parent temporal values are CREATE-TIME DEFAULTS, not permanent
-        # inherited constraints. Explicit child values always win.
-        if parent is not None:
-            if 'start_date' not in validated_data:
-                validated_data['start_date'] = parent.start_date
-            if 'due_date' not in validated_data:
-                validated_data['due_date'] = parent.due_date
-
-            # If an executable anchored parent becomes structural, preserve
-            # the parent's canonical anchor and let the newly required child
-            # inherit that date intent.
-            if (
-                'manual_requested_date' not in validated_data
-                and parent.manual_requested_date is not None
-            ):
-                validated_data['manual_requested_date'] = parent.manual_requested_date
-
-        validated_data.setdefault(
-            'sibling_order',
-            PlanningItem.objects.filter(user=user, parent=parent).count() + 1,
-        )
-
-        item = PlanningItem.objects.create(user=user, **validated_data)
-
-        # Adding unfinished required work means a previously-completed parent
-        # is no longer semantically complete.
-        if parent is not None and not item.is_completed and parent.is_completed:
-            parent.is_completed = False
-            parent.save(update_fields=['is_completed'])
+        item = domain_commands.create_item(user, **validated_data)
 
         if detail:
             AssignmentDetail.objects.create(planning_item=item, **detail)
         if tags:
             self._set_tags(item, tags)
 
-        # Creation changes canonical frontier membership:
-        #
-        # * a new executable root/leaf enters global priority;
-        # * a first unfinished child makes its parent structural;
-        # * a child created under a structural branch becomes frontier work.
-        #
-        # Reconcile canonical priority here. The scheduler must only consume
-        # this already-reconciled state.
-        priority.reconcile(user)
-        scheduling.schedule(user)
-
-        item.refresh_from_db()
         return item
 
     def update(self, instance, validated_data):
+        from django.db import transaction
+        from planning.services import domain_commands
         detail = validated_data.pop('assignment_detail', serializers.empty)
         tags = validated_data.pop('tags', serializers.empty)
         validated_data.pop('user', None)
-
-        for field, value in validated_data.items():
-            setattr(instance, field, value)
-        instance.save()
-
-        if detail is not serializers.empty:
-            self._set_detail(instance, detail)
-        if tags is not serializers.empty:
-            self._set_tags(instance, tags)
-
-        changed = set(validated_data)
-
-        frontier_fields = {
-            'item_type',
-            'parent',
-            'is_completed',
-        }
-
-        scheduling_fields = {
-            'item_type',
-            'start_date',
-            'due_date',
-            'duration_category',
-            'parent',
-            'is_completed',
-            'scheduled_date',
-            'manual_requested_date',
-            'schedule_is_manual',
-        }
-
-        if frontier_fields & changed:
-            from planning.services import priority
-            priority.reconcile(instance.user)
-
-        if scheduling_fields & changed:
-            from planning.services import scheduling
-            scheduling.schedule(instance.user)
-
-        instance.refresh_from_db()
+        with transaction.atomic():
+            instance = domain_commands.update_item(instance, validated_data)
+            if detail is not serializers.empty:
+                self._set_detail(instance, detail)
+            if tags is not serializers.empty:
+                self._set_tags(instance, tags)
         return instance
 
     def _set_detail(self, item, detail):
@@ -323,7 +247,7 @@ class TimelineItemSerializer(serializers.ModelSerializer):
         model = PlanningItem
         fields = [
             'id', 'parent', 'title', 'item_type', 'start_date', 'due_date', 'scheduled_date',
-            'schedule_is_manual', 'duration_category', 'is_completed', 'priority_position',
+            'execution_rank', 'duration_category', 'is_completed', 'priority_position',
             'overdue', 'submission_url', 'hierarchy_path', 'has_children',
         ]
 
@@ -383,12 +307,6 @@ class ScheduleReplaceSerializer(serializers.Serializer):
     replacement_id = serializers.IntegerField()
     displaced_id = serializers.IntegerField()
     allow_overload = serializers.BooleanField(default=False)
-
-
-class ScheduleCapacitySerializer(serializers.Serializer):
-    under_20 = serializers.IntegerField(min_value=0, max_value=32767, required=False)
-    minutes_20_to_60 = serializers.IntegerField(min_value=0, max_value=32767, required=False)
-    over_60 = serializers.IntegerField(min_value=0, max_value=32767, required=False)
 
 
 class ScheduleOverloadSerializer(serializers.Serializer):

@@ -26,6 +26,9 @@ def validate_parent(item, new_parent):
     if new_parent is None:
         return
 
+    if new_parent.is_deleted:
+        raise ValidationError('A deleted item cannot be a parent.')
+
     if new_parent.user_id != item.user_id:
         raise ValidationError('A planning item cannot be moved under another user\'s item.')
 
@@ -49,6 +52,11 @@ def validate_parent(item, new_parent):
 @transaction.atomic
 def set_parent(item, new_parent):
     """Validate and apply a re-parent, keeping sibling numbering dense."""
+    from . import lifecycle
+    original = item
+    item = lifecycle.active(item)
+    if new_parent is not None:
+        new_parent.refresh_from_db()
     validate_parent(item, new_parent)
     old_parent = item.parent
 
@@ -62,11 +70,12 @@ def set_parent(item, new_parent):
     # Reparenting can change frontier eligibility for the moved item,
     # its old parent and its new parent. Canonical priority must therefore
     # reconcile here, before the scheduler consumes the resulting state.
-    priority.reconcile(item.user)
-    scheduling.schedule(item.user)
+    if not item.is_completed:
+        lifecycle.reopen_ancestors(item)
+    lifecycle.finish(item.user)
 
-    item.refresh_from_db(fields=['priority_position'])
-    return item
+    original.refresh_from_db()
+    return original
 
 
 def _siblings(user, parent):
@@ -97,13 +106,25 @@ def reindex_siblings(user, parent=None):
 
 
 @transaction.atomic
-def complete_subtree(item):
+def complete_subtree(item, *, reconcile=True):
     """Mark an item and everything under it complete (FR-08).
 
     Completed tasks leave the priority order, which keeps the FR-09 invariant
     that a position belongs to an active task.
     """
+    from . import lifecycle
+    from planning.models import ProgressSegment, SPLITTABLE_DURATION_CATEGORIES
+    from decimal import Decimal
+    from django.utils import timezone
+    original = item
+    item = lifecycle.active(item)
     ids = [item.pk] + descendant_ids(item.user_id, item.pk)
+    for row in PlanningItem.objects.for_user(item.user).filter(pk__in=ids, is_completed=False, duration_category__in=SPLITTABLE_DURATION_CATEGORIES):
+        remaining = Decimal(100) - row.percent_completed
+        if remaining > 0:
+            ProgressSegment.objects.create(item=row, percentage=remaining, is_completed=True, completed_at=timezone.now())
+        row.percent_completed = 100
+        row.save(update_fields=["percent_completed"])
 
     PlanningItem.objects.visible().filter(
         user_id=item.user_id,
@@ -113,21 +134,27 @@ def complete_subtree(item):
     # Completion is a canonical frontier transition. Departing tasks must
     # lose their active positions while preserving restore neighbourhood,
     # and newly exposed residual ancestors must enter that neighbourhood.
-    priority.reconcile(item.user)
-    scheduling.schedule(item.user)
+    if reconcile:
+        lifecycle.finish(item.user)
 
-    item.refresh_from_db()
+    original.refresh_from_db()
     return ids
 
 
 @transaction.atomic
-def reopen(item):
+def reopen(item, *, reconcile=True):
     """Mark a single item incomplete again and give it a priority position.
 
     Deliberately not a cascade: FR-08 only requires completion to propagate
     downwards, and re-opening a root should not silently re-open a subtree the
     user finished individually.
     """
+    from . import lifecycle
+    from planning.models import SPLITTABLE_DURATION_CATEGORIES
+    original = item
+    item = lifecycle.active(item)
+    if item.duration_category in SPLITTABLE_DURATION_CATEGORIES and item.percent_completed:
+        raise ValidationError("Reverse a confirmed progress segment to reopen large work.")
     PlanningItem.objects.visible().filter(
         pk=item.pk,
         user=item.user,
@@ -135,8 +162,23 @@ def reopen(item):
 
     # Reopening may return this task to the frontier and may simultaneously
     # make an ancestor structural again. Restore canonical priority first.
-    priority.reconcile(item.user)
-    scheduling.schedule(item.user)
+    lifecycle.reopen_ancestors(item)
+    if reconcile:
+        lifecycle.finish(item.user)
 
+    original.refresh_from_db()
+    return original
+
+
+@transaction.atomic
+def set_sibling_order(item, position):
+    """Move within one sibling group without changing global importance."""
+    from . import lifecycle
+    item = lifecycle.active(item)
+    siblings = list(_siblings(item.user, item.parent).exclude(pk=item.pk))
+    siblings.insert(max(0, min(int(position) - 1, len(siblings))), item)
+    for index, row in enumerate(siblings, 1):
+        row.sibling_order = index
+    PlanningItem.objects.bulk_update(siblings, ['sibling_order'])
     item.refresh_from_db()
     return item

@@ -14,22 +14,19 @@ from planning.models import (
     ProgressSegment,
     SchedulerAllocation,
     SchedulingOverload,
-    SchedulingPreference,
     SchedulingState,
     SPLITTABLE_DURATION_CATEGORIES,
 )
 from planning.services import history, leaf_order_sync, priority
 
-BUCKET_FIELDS = {
-    # Existing preference storage is temporarily mapped onto the frozen
-    # six-category duration model. Capacity policy itself is scheduler-owned
-    # and will be refined in the scheduler/allocation cluster.
-    DurationCategory.UNDER_20_MINUTES: 'under_20',
-    DurationCategory.UNDER_1_HOUR: 'minutes_20_to_60',
-    DurationCategory.UNDER_4_HOURS: 'over_60',
-    DurationCategory.UNDER_8_HOURS: 'over_60',
-    DurationCategory.UNDER_16_HOURS: 'over_60',
-    DurationCategory.OVER_16_HOURS: 'over_60',
+# Baseline scheduler policy, intentionally replaceable by future algorithm policy.
+BASELINE_SCHEDULER_CAPACITY = {
+    DurationCategory.UNDER_20_MINUTES: 5,
+    DurationCategory.UNDER_1_HOUR: 4,
+    DurationCategory.UNDER_4_HOURS: 3,
+    DurationCategory.UNDER_8_HOURS: 3,
+    DurationCategory.UNDER_16_HOURS: 3,
+    DurationCategory.OVER_16_HOURS: 3,
 }
 
 
@@ -40,8 +37,7 @@ class SchedulingConflict(Exception):
 
 
 def capacities(user):
-    settings = SchedulingPreference.objects.filter(user=user).first() or SchedulingPreference()
-    return {bucket: getattr(settings, field) for bucket, field in BUCKET_FIELDS.items()}
+    return dict(BASELINE_SCHEDULER_CAPACITY)
 
 
 def _conflict(item, code):
@@ -64,7 +60,10 @@ def _scheduler_eligible(user):
         PlanningItem.objects.for_user(user)
         .actionable()
         .filter(is_completed=False, is_deleted=False)
-        .annotate(has_unfinished_children=Exists(unfinished_children))
+        .annotate(
+            has_unfinished_children=Exists(unfinished_children),
+            is_residual=Exists(PlanningItem.objects.visible().filter(user=user, parent_id=OuterRef('pk'))),
+        )
         .filter(has_unfinished_children=False)
         .exclude(
             blocked_by_dependencies__prerequisite__is_completed=False,
@@ -98,7 +97,7 @@ def _validate_date(item, day, today):
 
 @transaction.atomic
 def schedule(user, today=None, *, mode='minimal'):
-    """Repair invariants, or globally reconsider automatic dates when requested.
+    """Generate proposals from canonical state, reconsidering dates in global mode.
 
     Capacity is soft when deadlines are infeasible. Release dates remain hard;
     overdue and user-fixed dates are retained, with conflicts reported.
@@ -133,14 +132,19 @@ def schedule(user, today=None, *, mode='minimal'):
     if stale:
         for item in stale:
             item.scheduled_date = None
-            item.schedule_is_manual = False
         PlanningItem.objects.bulk_update(
             stale,
-            ['scheduled_date', 'schedule_is_manual'],
+            ['scheduled_date'],
         )
 
     usage = Counter()
     conflicts, changed, pending = [], [], []
+    for blocked in PlanningItem.objects.for_user(user).filter(
+        is_completed=False, manual_requested_date__gte=today,
+        blocked_by_dependencies__prerequisite__is_completed=False,
+        blocked_by_dependencies__prerequisite__is_deleted=False,
+    ).distinct():
+        conflicts.append(_conflict(blocked, 'blocked_dependency'))
 
     def assign(item, day):
         if item.scheduled_date != day:
@@ -148,29 +152,16 @@ def schedule(user, today=None, *, mode='minimal'):
             changed.append(item)
 
     for item in items:
-        bucket = item.duration_category
+        bucket = DurationCategory.UNDER_20_MINUTES if item.is_residual else item.duration_category
         if bucket not in limits:
             conflicts.append(_conflict(item, 'duration_required'))
             continue
         if item.due_date and item.due_date < today:
             conflicts.append(_conflict(item, 'overdue'))
-            # Legacy NULLs use the last legal execution day. Contradictory
-            # release/deadline constraints are reported, never silently edited.
-            if item.scheduled_date is None:
-                assign(item, item.due_date)
-            if item.start_date and item.start_date > item.due_date:
-                conflicts.append(_conflict(item, 'before_start'))
-            continue
-        # Canonical anchor/manual date intent has authority over disposable
-        # scheduler proposals. Legacy schedule_is_manual remains supported
-        # while old API paths are migrated.
-        anchored_day = item.manual_requested_date
-        legacy_manual_day = (
-            item.scheduled_date
-            if item.schedule_is_manual and item.scheduled_date
-            else None
-        )
-        manual_day = anchored_day or legacy_manual_day
+        # Expired intent remains recovery history, never a hard placement.
+        manual_day = item.manual_requested_date
+        if manual_day and manual_day < today:
+            manual_day = None
 
         if manual_day:
             day = manual_day
@@ -180,12 +171,15 @@ def schedule(user, today=None, *, mode='minimal'):
             if usage[(day, bucket)] >= limits[bucket] and day not in overloaded:
                 conflicts.append(_conflict(item, 'capacity_exceeded'))
             usage[(day, bucket)] += 1
+            if item.start_date and day < item.start_date:
+                assign(item, None)
+                continue
             assign(item, day)
         else:
             pending.append(item)
 
     for item in pending:
-        bucket = item.duration_category
+        bucket = DurationCategory.UNDER_20_MINUTES if item.is_residual else item.duration_category
         lower = max(today, item.start_date or today)
         day = lower
         if mode == 'minimal' and item.scheduled_date and not _validate_date(item, item.scheduled_date, today):
@@ -214,9 +208,29 @@ def schedule(user, today=None, *, mode='minimal'):
     # Proposed allocations are disposable scheduler output. Rebuild only the
     # unconfirmed projections; confirmed segments remain canonical progress.
     _reconcile_progress_allocations(user, today)
+    # Rank is disposable execution advice, independent of canonical priority.
+    ranks = Counter()
+    for item in sorted(items, key=lambda row: (row.scheduled_date or timezone.datetime.max.date(), _scheduling_order(row))):
+        if item.scheduled_date is not None:
+            ranks[item.scheduled_date] += 1
+            item.execution_rank = ranks[item.scheduled_date]
+        else:
+            item.execution_rank = None
+    PlanningItem.objects.filter(user=user).exclude(pk__in=eligible_ids).update(execution_rank=None)
+    if items:
+        PlanningItem.objects.bulk_update(items, ['execution_rank'])
+    allocations = list(SchedulerAllocation.objects.filter(item__user=user).select_related('item'))
+    ranks = Counter()
+    for allocation in sorted(allocations, key=lambda row: (row.scheduled_date, _scheduling_order(row.item))):
+        ranks[allocation.scheduled_date] += 1
+        allocation.execution_rank = ranks[allocation.scheduled_date]
+        if allocation.item.due_date and allocation.scheduled_date > allocation.item.due_date:
+            conflict = _conflict(allocation.item, 'allocation_after_deadline')
+            if conflict not in conflicts:
+                conflicts.append(conflict)
+    if allocations:
+        SchedulerAllocation.objects.bulk_update(allocations, ['execution_rank'])
 
-    # Canonical 100% progress and completion must never diverge.
-    reconcile_progress(user)
 
     return {'changed_ids': [item.pk for item in changed], 'conflicts': conflicts}
 
@@ -241,12 +255,12 @@ def _expire_past_manual_anchors(user, today):
         return []
 
     for item in expired:
+        item.expired_manual_requested_date = item.manual_requested_date
         item.manual_requested_date = None
-        item.schedule_is_manual = False
 
     PlanningItem.objects.bulk_update(
         expired,
-        ['manual_requested_date', 'schedule_is_manual'],
+        ['manual_requested_date', 'expired_manual_requested_date'],
     )
     return [item.pk for item in expired]
 
@@ -289,12 +303,11 @@ def _snapshot(user):
         'leaf_siblings': history.capture_leaf_order(user),
         'schedule': [
             {'id': item.pk, 'scheduled_date': item.scheduled_date.isoformat() if item.scheduled_date else None,
-             'schedule_is_manual': item.schedule_is_manual, 'priority_restore_context': item.priority_restore_context}
+             'manual_requested_date': item.manual_requested_date.isoformat() if item.manual_requested_date else None, 'priority_restore_context': item.priority_restore_context}
             for item in PlanningItem.objects.filter(user=user).order_by('pk')
         ],
         'overload': [{'date': row.date.isoformat(), 'allowed': row.allowed}
                      for row in SchedulingOverload.objects.filter(user=user).order_by('date')],
-        'capacity': list(SchedulingPreference.objects.filter(user=user).values(*BUCKET_FIELDS.values())),
     }
 
 
@@ -341,12 +354,10 @@ def move_to_date(user, item_id, day, *, allow_overload=False, today=None):
     # scheduled_date from this anchor, but cannot silently erase the intent.
     item.manual_requested_date = day
     item.scheduled_date = day
-    item.schedule_is_manual = True
     item.save(
         update_fields=[
             'manual_requested_date',
             'scheduled_date',
-            'schedule_is_manual',
         ]
     )
     # Existing conflicts on the manipulated item must not be swallowed.
@@ -369,32 +380,22 @@ def replace(user, replacement_id, displaced_id, *, allow_overload=False, today=N
         raise SchedulingConflict([_conflict(replacement, 'duration_required')])
     if allow_overload:
         SchedulingOverload.objects.update_or_create(user=user, date=day, defaults={'allowed': True})
-    ids = [row.pk for row in priority.ordered(user) if row.pk != replacement.pk]
-    priority.reorder(user, replacement.pk, ids.index(displaced.pk) + 1)
-    remaining = [row for row in priority.ordered(user) if row.pk != displaced.pk]
-    last = max(i for i, row in enumerate(remaining)
-               if row.pk == replacement.pk or row.scheduled_date == day)
-    priority.reorder(user, displaced.pk, last + 2)
-    replacement.scheduled_date, replacement.schedule_is_manual = day, True
-    replacement.save(update_fields=['scheduled_date', 'schedule_is_manual'])
-    displaced.schedule_is_manual = SchedulingOverload.objects.filter(user=user, date=day, allowed=True).exists()
-    displaced.save(update_fields=['schedule_is_manual'])
-    if displaced.schedule_is_manual:
-        # The explicit replacement keeps the day's existing normal work; these
-        # reservations may exceed capacity, but subsequent automatic work cannot.
-        day_ids = [row.pk for row in priority.ordered(user) if row.scheduled_date == day]
-        PlanningItem.objects.filter(user=user, pk__in=day_ids).update(schedule_is_manual=True)
-    leaf_order_sync.from_priority(user)
+    # Replacement is date intent, not a global importance reorder. A
+    # scheduler candidate can legitimately have no current priority position.
+    replacement.manual_requested_date = day
+    replacement.scheduled_date = day
+    replacement.save(update_fields=['manual_requested_date', 'scheduled_date'])
+    displaced.manual_requested_date = day if allow_overload else None
+    displaced.scheduled_date = day if allow_overload else day + timedelta(days=1)
+    displaced.save(update_fields=['manual_requested_date', 'scheduled_date'])
     baseline = {pair for pair in baseline if pair[0] not in {replacement.pk, displaced.pk}}
     return _finish(user, before, today, baseline)
 
 
 @transaction.atomic
-def configure(user, *, capacity=None, day=None, overloaded=None, today=None):
+def configure(user, *, day=None, overloaded=None, today=None):
     today = today or timezone.localdate()
     before, baseline = _begin(user, today)
-    if capacity is not None:
-        SchedulingPreference.objects.update_or_create(user=user, defaults=capacity)
     if day is not None:
         SchedulingOverload.objects.update_or_create(user=user, date=day, defaults={'allowed': overloaded})
     return _finish(user, before, today, baseline)
@@ -418,7 +419,8 @@ def set_anchor(
     Crossing release/deadline boundaries is never silently repaired. The
     caller must explicitly authorize the corresponding canonical date change.
     """
-    item = PlanningItem.objects.select_for_update().get(pk=item.pk)
+    from . import lifecycle
+    item = lifecycle.active(item)
 
     if item.is_deleted or item.is_completed:
         raise ValidationError("Only active unfinished work can be anchored.")
@@ -454,7 +456,10 @@ def set_anchor(
             defaults={"allowed": True},
         )
 
-    schedule(item.user)
+    result = schedule(item.user)
+    conflicts = [c for c in result['conflicts'] if c['item_id'] == item.pk and c['code'] == 'capacity_exceeded']
+    if conflicts and not allow_overload:
+        raise ValidationError('Anchor overload requires explicit confirmation.')
     item.refresh_from_db()
     return item
 
@@ -467,10 +472,11 @@ request_date = set_anchor
 @transaction.atomic
 def remove_anchor(item: PlanningItem):
     """Explicitly return placement authority to automatic scheduling."""
-    item = PlanningItem.objects.select_for_update().get(pk=item.pk)
+    from . import lifecycle
+    item = lifecycle.active(item)
     item.manual_requested_date = None
-    item.schedule_is_manual = False
-    item.save(update_fields=["manual_requested_date", "schedule_is_manual"])
+    item.expired_manual_requested_date = None
+    item.save(update_fields=["manual_requested_date", "expired_manual_requested_date"])
     schedule(item.user)
     item.refresh_from_db()
     return item
@@ -491,6 +497,7 @@ def validate_anchor(item: PlanningItem, day):
     return conflicts
 
 
+@transaction.atomic
 def reconcile_anchors(user, today=None):
     """Time reconciliation for expired explicit date intent."""
     today = today or timezone.localdate()
@@ -534,7 +541,7 @@ def _reconcile_progress_allocations(user, today=None):
     allocations = []
 
     for item in candidates:
-        if item.duration_category not in _SPLITTABLE_VALUES:
+        if item.is_residual or item.scheduled_date is None or item.duration_category not in _SPLITTABLE_VALUES:
             continue
 
         remaining = Decimal("100") - Decimal(str(item.percent_completed))

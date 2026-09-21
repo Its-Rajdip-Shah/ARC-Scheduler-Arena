@@ -20,7 +20,7 @@ import django
 django.setup()
 
 from accounts.models import User
-from planning.models import PlanningItem, SchedulingPreference
+from planning.models import PlanningItem
 
 
 DURATION_MAP = {
@@ -48,7 +48,6 @@ def available_scenarios() -> list[str]:
 def load_scenario(name: str) -> None:
     scenario_rows = _rows("scenarios.csv")
     item_rows = _rows("items.csv")
-    capacity_rows = _rows("capacities.csv")
 
     scenario = next(
         (row for row in scenario_rows if row["scenario"] == name),
@@ -68,26 +67,12 @@ def load_scenario(name: str) -> None:
 
     # Arena DB is disposable. Keep exactly one benchmark user/state loaded.
     PlanningItem.objects.all().delete()
-    SchedulingPreference.objects.all().delete()
     User.objects.filter(email="arena@local.test").delete()
 
     user = User.objects.create_user(
         email="arena@local.test",
         password="arena-local-only",
     )
-
-    capacity = next(
-        (row for row in capacity_rows if row["scenario"] == name),
-        None,
-    )
-
-    if capacity:
-        SchedulingPreference.objects.create(
-            user=user,
-            under_20=int(capacity["under_20"]),
-            minutes_20_to_60=int(capacity["min_20_to_60"]),
-            over_60=int(capacity["over_60"]),
-        )
 
     by_key: dict[str, PlanningItem] = {}
     remaining = rows[:]
@@ -108,7 +93,7 @@ def load_scenario(name: str) -> None:
                 "parent": by_key.get(parent_key),
                 "duration_category": DURATION_MAP[row["duration_class"]],
                 "is_completed": row["completed"].lower() == "true",
-                "schedule_is_manual": row["anchored"].lower() == "true",
+                "manual_requested_date": (row["scheduled_date"] or None) if row["anchored"].lower() == "true" else None,
             }
 
             if row["release_date"]:
@@ -152,7 +137,7 @@ def print_hierarchy() -> None:
 
     def walk(item: PlanningItem, depth: int = 0) -> None:
         marker = "✓" if item.is_completed else "•"
-        anchor = " ⚓" if item.schedule_is_manual else ""
+        anchor = " ⚓" if item.manual_requested_date is not None else ""
 
         print(
             f"{'    ' * depth}{marker} "

@@ -9,7 +9,7 @@ from datetime import date, timedelta
 import pytest
 from freezegun import freeze_time
 
-from planning.models import ItemType, PlanningItem, SchedulingPreference
+from planning.models import DurationCategory, ItemType, PlanningItem
 from planning.services import priority, scheduling
 
 pytestmark = pytest.mark.django_db
@@ -61,13 +61,14 @@ def test_a_future_date_is_left_alone(user, make_item, root):
 
 
 @freeze_time(FROZEN)
-def test_a_task_with_an_expired_deadline_recovers_last_legal_date(user, make_item, root):
+def test_a_task_with_an_expired_deadline_recovers_without_changing_deadline(user, make_item, root):
     fixed = make_item(user, 'fixed', parent=root, due_date=days(-5))
 
     scheduling.roll_forward_adaptive(user, TODAY)
 
     fixed.refresh_from_db()
-    assert fixed.scheduled_date == fixed.due_date
+    assert fixed.scheduled_date >= TODAY
+    assert fixed.due_date == days(-5)
 
 
 @freeze_time(FROZEN)
@@ -133,8 +134,8 @@ def test_an_overdue_task_is_rescheduled_rather_than_marked_overdue(user, make_it
 # --------------------------------------------------------------------------
 
 @freeze_time(FROZEN)
-def test_a_collision_pushes_the_lower_priority_task_along(user, make_item, root):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
+def test_a_collision_pushes_the_lower_priority_task_along(user, make_item, root, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
     first = make_item(user, 'first', parent=root, scheduled_date=days(-1))
     second = make_item(user, 'second', parent=root, scheduled_date=TODAY)
     priority.assign_initial_position(first)
@@ -146,8 +147,8 @@ def test_a_collision_pushes_the_lower_priority_task_along(user, make_item, root)
 
 
 @freeze_time(FROZEN)
-def test_a_collision_cascades_down_a_whole_run(user, make_item, root):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
+def test_a_collision_cascades_down_a_whole_run(user, make_item, root, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
     made = []
     for index, offset in enumerate([-1, 0, 1, 2]):
         item = make_item(user, f'task-{index}', parent=root, scheduled_date=days(offset))
@@ -165,9 +166,9 @@ def test_a_collision_cascades_down_a_whole_run(user, make_item, root):
 
 
 @freeze_time(FROZEN)
-def test_priority_order_decides_who_moves(user, make_item, root):
+def test_priority_order_decides_who_moves(user, make_item, root, monkeypatch):
     """Both tasks want today; the one lower down the Priority View yields."""
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
     low = make_item(user, 'low', parent=root, scheduled_date=TODAY)
     high = make_item(user, 'high', parent=root, scheduled_date=TODAY)
     priority.assign_initial_position(low)
@@ -180,9 +181,9 @@ def test_priority_order_decides_who_moves(user, make_item, root):
 
 
 @freeze_time(FROZEN)
-def test_collisions_are_resolved_globally_across_roots(user, make_item):
+def test_collisions_are_resolved_globally_across_roots(user, make_item, monkeypatch):
     """Different roots share the same user capacity."""
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
     first_root = make_item(user, 'course-a', ItemType.GOAL)
     second_root = make_item(user, 'course-b', ItemType.GOAL)
     a = make_item(user, 'a-task', parent=first_root, scheduled_date=TODAY)
@@ -196,8 +197,8 @@ def test_collisions_are_resolved_globally_across_roots(user, make_item):
 
 
 @freeze_time(FROZEN)
-def test_a_deeply_nested_task_groups_by_its_root(user, make_item, root):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
+def test_a_deeply_nested_task_groups_by_its_root(user, make_item, root, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
     mid = make_item(user, 'mid', ItemType.GOAL, parent=root)
     deep = make_item(user, 'deep', parent=mid, scheduled_date=TODAY)
     shallow = make_item(user, 'shallow', parent=root, scheduled_date=TODAY)

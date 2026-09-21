@@ -20,7 +20,7 @@ from django.utils.dateparse import parse_datetime
 from canvas_integration.client import CanvasClient, CanvasError
 from canvas_integration.models import SyncLog, SyncStatus
 from planning.models import AssignmentDetail, CanvasObjectType, ItemType, PlanningItem
-from planning.services import scheduling
+from planning.services import scheduling, priority, lifecycle
 
 
 def _as_date(value):
@@ -49,6 +49,7 @@ def _import_course(user, client, course, counts):
     assignments = client.assignments(course['id'])
 
     with transaction.atomic():
+        priority._lock(user)
         root, created = PlanningItem.objects.update_or_create(
             user=user,
             canvas_object_type=CanvasObjectType.COURSE,
@@ -65,7 +66,7 @@ def _import_course(user, client, course, counts):
             if assignment.get('id') is None:
                 continue
             _import_assignment(user, root, assignment, counts)
-        scheduling.schedule(user)
+        lifecycle.finish(user)
 
 
 def _import_assignment(user, root, assignment, counts):
@@ -92,6 +93,9 @@ def _import_assignment(user, root, assignment, counts):
         planning_item=item,
         defaults={'submission_url': assignment.get('html_url') or None},
     )
+
+    if not item.is_completed:
+        lifecycle.reopen_ancestors(item)
 
     counts['assignments_created' if created else 'assignments_updated'] += 1
 

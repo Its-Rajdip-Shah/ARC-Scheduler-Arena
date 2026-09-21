@@ -5,11 +5,8 @@ densely from 1, and no two share a number. Completed and non-actionable items
 hold NULL. Keeping that invariant is entirely this module's job; the database
 backs it up with uniq_user_priority_position.
 
-That constraint is DEFERRABLE INITIALLY DEFERRED, which is what makes the
-renumbering below straightforward: a reorder walks positions through states
-that contain duplicates, and only the committed result has to be unique. An
-immediate constraint would force each write to dodge its neighbour, usually by
-shifting everything into a temporary offset range and back again.
+The unique constraint is immediate on every supported database. Atomic
+permutations temporarily release affected slots before assigning final values.
 """
 
 from django.contrib.auth import get_user_model
@@ -47,7 +44,7 @@ def assign_initial_position(task):
     Does nothing for goals, completed items, or a task that already holds a
     position, so it is safe to call from a save path.
     """
-    if not task.is_actionable or task.is_completed or task.priority_position is not None:
+    if not PlanningItem.objects.filter(pk=task.pk, user=task.user).priority_eligible().exists() or task.priority_position is not None:
         return task.priority_position
 
     _lock(task.user)
@@ -70,13 +67,19 @@ def renumber(user):
             item.priority_position = position
             changed.append(item)
     if changed:
-        PlanningItem.objects.bulk_update(changed, ['priority_position'])
+        _write_positions(changed)
     return items
 
 
 def _remember_departures(user, departing_ids):
     rows = list(PlanningItem.objects.filter(user=user, priority_position__isnull=False)
                 .order_by('priority_position', 'pk'))
+    # Include temporarily absent neighbours when capturing a later departure.
+    # Otherwise A leaving while B is blocked forgets that A preceded B.
+    dormant = PlanningItem.objects.filter(user=user, priority_position=None).order_by('pk')
+    for row in dormant:
+        if row.priority_restore_context:
+            _insert_restored(rows, row)
     ids = [row.pk for row in rows]
     changed = []
     for index, row in enumerate(rows):
@@ -205,7 +208,7 @@ def reconcile(user):
             changed.append(item)
 
     if changed:
-        PlanningItem.objects.bulk_update(changed, ['priority_position'])
+        _write_positions(changed)
 
     return ordered_items
 
@@ -234,9 +237,8 @@ def reorder(user, item_id, new_position):
             item.priority_position = position
             changed.append(item)
     if changed:
-        # Passes through duplicate positions; legal only because the unique
-        # constraint is deferred to COMMIT.
-        PlanningItem.objects.bulk_update(changed, ['priority_position'])
+        # Apply an atomic permutation without transient duplicate positions.
+        _write_positions(changed)
 
     return items
 
@@ -270,3 +272,10 @@ def restore_position(task):
     reconcile(task.user)
     task.refresh_from_db(fields=['priority_position'])
     return task.priority_position
+
+
+def _write_positions(items):
+    """Release affected slots before assigning a permutation on either DB."""
+    if items:
+        PlanningItem.objects.filter(pk__in=[item.pk for item in items]).update(priority_position=None)
+        PlanningItem.objects.bulk_update(items, ['priority_position'])

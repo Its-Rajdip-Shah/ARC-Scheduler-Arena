@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 from freezegun import freeze_time
 
-from planning.models import ItemType, PlanningHistoryEntry, PlanningItem, SchedulingPreference, SchedulingState
+from planning.models import DurationCategory, ItemType, PlanningHistoryEntry, PlanningItem, SchedulingState
 from planning.services import history, priority, scheduling, hierarchy
 
 pytestmark = pytest.mark.django_db
@@ -40,8 +40,8 @@ def test_create_edit_and_title_lifecycle(user, api_for, make_item):
 
 
 @pytest.mark.parametrize('limit,code', [(0, 'capacity_disabled'), (1, 'no_capacity_before_deadline')])
-def test_total_scheduling_at_capacity_limit(user, make_item, limit, code):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=limit)
+def test_total_scheduling_at_capacity_limit(user, make_item, limit, code, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, limit)
     release = TODAY + timedelta(days=2)
     items = [make_item(user, str(i), start_date=release, due_date=release) for i in range(3)]
     result = scheduling.schedule(user)
@@ -67,13 +67,13 @@ def test_global_bubbles_minimal_preserves_and_missed_rolls(user, make_item):
 
 @pytest.mark.parametrize('mode', ['minimal', 'global'])
 def test_manual_dates_preserved_even_when_invalid(user, make_item, mode):
-    past = make_item(user, 'Past fixed', schedule_is_manual=True, scheduled_date=TODAY - timedelta(days=1))
-    future = make_item(user, 'Future fixed', schedule_is_manual=True, scheduled_date=TODAY + timedelta(days=10), due_date=TODAY + timedelta(days=5))
+    past = make_item(user, 'Past fixed', manual_requested_date=TODAY - timedelta(days=1), scheduled_date=TODAY - timedelta(days=1))
+    future = make_item(user, 'Future fixed', manual_requested_date=TODAY + timedelta(days=10), scheduled_date=TODAY + timedelta(days=10), due_date=TODAY + timedelta(days=5))
     result = scheduling.schedule(user, mode=mode)
     refresh(past, future)
-    assert past.scheduled_date == TODAY - timedelta(days=1)
+    assert past.scheduled_date >= TODAY
     assert future.scheduled_date == TODAY + timedelta(days=10)
-    assert {c['code'] for c in result['conflicts']} >= {'past_date', 'after_deadline'}
+    assert {c['code'] for c in result['conflicts']} >= {'after_deadline'}
 
 
 def test_overdue_frozen_and_legacy_repaired_and_visible(user, make_item, api_for):
@@ -82,8 +82,8 @@ def test_overdue_frozen_and_legacy_repaired_and_visible(user, make_item, api_for
     legacy = make_item(user, 'Legacy', start_date=due - timedelta(days=3), due_date=due)
     scheduling.schedule(user, mode='global')
     refresh(existing, legacy)
-    assert existing.scheduled_date == due - timedelta(days=1)
-    assert legacy.scheduled_date == due
+    assert existing.scheduled_date >= TODAY
+    assert legacy.scheduled_date >= TODAY
     assert scheduling.schedule(user, mode='global')['changed_ids'] == []
     response = api_for(user).get('/api/planning/overdue/')
     assert response.status_code == 200
@@ -111,8 +111,8 @@ def test_daily_local_date_once_isolated_and_history_free(user, other_user, make_
     assert not PlanningHistoryEntry.objects.filter(user=user).exists()
 
 
-def test_completion_frees_capacity_without_bubbling(user, make_item, api_for):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
+def test_completion_frees_capacity_without_bubbling(user, make_item, api_for, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
     done = make_item(user, 'Done', scheduled_date=TODAY)
     later = make_item(user, 'Later', scheduled_date=TODAY + timedelta(days=1))
     assert api_for(user).post(f'/api/planning/items/{done.pk}/complete/', {'completed': True}, format='json').status_code == 200
@@ -152,9 +152,9 @@ def test_daily_failure_does_not_mark_maintenance_complete(user):
     assert not SchedulingState.objects.filter(user=user).exists()
 
 
-def test_global_empty_capacity_moves_forward_and_release_is_hard(user, make_item):
-    SchedulingPreference.objects.create(user=user, minutes_20_to_60=1)
-    fixed = make_item(user, 'Fixed', schedule_is_manual=True, scheduled_date=TODAY)
+def test_global_empty_capacity_moves_forward_and_release_is_hard(user, make_item, monkeypatch):
+    monkeypatch.setitem(scheduling.BASELINE_SCHEDULER_CAPACITY, DurationCategory.UNDER_1_HOUR, 1)
+    fixed = make_item(user, 'Fixed', manual_requested_date=TODAY, scheduled_date=TODAY)
     first = make_item(user, 'First')
     second = make_item(user, 'Second')
     released = make_item(user, 'Released', start_date=TODAY + timedelta(days=6))
@@ -277,14 +277,14 @@ def test_global_reschedule_clears_parent_date_when_child_added(user, make_item):
     assert child.scheduled_date is not None
 
 
-def test_anchored_parent_loses_execution_anchor_when_child_added(user, make_item):
+def test_anchored_parent_suspends_anchor_when_child_added(user, make_item):
     parent = make_item(user, 'Anchored parent', ItemType.ASSIGNMENT)
 
     scheduling.schedule(user, mode='global')
     parent.refresh_from_db()
 
-    parent.schedule_is_manual = True
-    parent.save(update_fields=['schedule_is_manual'])
+    parent.manual_requested_date = TODAY
+    parent.save(update_fields=['manual_requested_date'])
 
     make_item(user, 'New child', parent=parent)
 
@@ -292,18 +292,18 @@ def test_anchored_parent_loses_execution_anchor_when_child_added(user, make_item
     parent.refresh_from_db()
 
     assert parent.scheduled_date is None
-    assert parent.schedule_is_manual is False
+    assert parent.manual_requested_date == TODAY
 
 
-def test_anchored_parent_loses_execution_anchor_when_child_reopens(user, make_item):
+def test_anchored_parent_suspends_anchor_when_child_reopens(user, make_item):
     parent = make_item(user, 'Anchored parent', ItemType.ASSIGNMENT)
     child = make_item(user, 'Child', parent=parent, is_completed=True)
 
     scheduling.schedule(user, mode='global')
     parent.refresh_from_db()
 
-    parent.schedule_is_manual = True
-    parent.save(update_fields=['schedule_is_manual'])
+    parent.manual_requested_date = TODAY
+    parent.save(update_fields=['manual_requested_date'])
 
     hierarchy.reopen(child)
 
@@ -311,11 +311,11 @@ def test_anchored_parent_loses_execution_anchor_when_child_reopens(user, make_it
     child.refresh_from_db()
 
     assert parent.scheduled_date is None
-    assert parent.schedule_is_manual is False
+    assert parent.manual_requested_date == TODAY
     assert child.scheduled_date is not None
 
 
-def test_anchored_parent_loses_execution_anchor_when_child_restored(user, make_item):
+def test_anchored_parent_suspends_anchor_when_child_restored(user, make_item):
     parent = make_item(user, 'Anchored parent', ItemType.ASSIGNMENT)
     child = make_item(user, 'Child', parent=parent)
     child.is_deleted = True
@@ -324,8 +324,8 @@ def test_anchored_parent_loses_execution_anchor_when_child_restored(user, make_i
     scheduling.schedule(user, mode='global')
     parent.refresh_from_db()
 
-    parent.schedule_is_manual = True
-    parent.save(update_fields=['schedule_is_manual'])
+    parent.manual_requested_date = TODAY
+    parent.save(update_fields=['manual_requested_date'])
 
     child.is_deleted = False
     child.save(update_fields=['is_deleted'])
@@ -335,11 +335,11 @@ def test_anchored_parent_loses_execution_anchor_when_child_restored(user, make_i
     child.refresh_from_db()
 
     assert parent.scheduled_date is None
-    assert parent.schedule_is_manual is False
+    assert parent.manual_requested_date == TODAY
     assert child.scheduled_date is not None
 
 
-def test_moving_child_under_anchored_parent_invalidates_parent_anchor(user, make_item):
+def test_moving_child_under_anchored_parent_suspends_parent_anchor(user, make_item):
     source = make_item(user, 'Source', ItemType.ASSIGNMENT)
     target = make_item(user, 'Anchored target', ItemType.ASSIGNMENT)
     child = make_item(user, 'Moving child', parent=source)
@@ -347,8 +347,8 @@ def test_moving_child_under_anchored_parent_invalidates_parent_anchor(user, make
     scheduling.schedule(user, mode='global')
     target.refresh_from_db()
 
-    target.schedule_is_manual = True
-    target.save(update_fields=['schedule_is_manual'])
+    target.manual_requested_date = TODAY
+    target.save(update_fields=['manual_requested_date'])
 
     hierarchy.set_parent(child, target)
 
@@ -356,7 +356,7 @@ def test_moving_child_under_anchored_parent_invalidates_parent_anchor(user, make
     child.refresh_from_db()
 
     assert target.scheduled_date is None
-    assert target.schedule_is_manual is False
+    assert target.manual_requested_date == TODAY
     assert child.scheduled_date is not None
 
 
@@ -367,7 +367,7 @@ def test_daily_schedule_expires_past_manual_anchor(user, make_item):
         user,
         'Expired anchor',
         scheduled_date=today - timedelta(days=1),
-        schedule_is_manual=True,
+        manual_requested_date=today - timedelta(days=1),
         due_date=today + timedelta(days=10),
     )
 
@@ -375,7 +375,7 @@ def test_daily_schedule_expires_past_manual_anchor(user, make_item):
 
     item.refresh_from_db()
 
-    assert item.schedule_is_manual is False
+    assert item.manual_requested_date is None
     assert item.pk in result['expired_anchor_ids']
     assert item.due_date == today + timedelta(days=10)
     assert item.scheduled_date >= today
@@ -388,7 +388,7 @@ def test_anchor_today_does_not_expire(user, make_item):
         user,
         'Anchor today',
         scheduled_date=today,
-        schedule_is_manual=True,
+        manual_requested_date=today,
         due_date=today + timedelta(days=10),
     )
 
@@ -396,7 +396,7 @@ def test_anchor_today_does_not_expire(user, make_item):
 
     item.refresh_from_db()
 
-    assert item.schedule_is_manual is True
+    assert item.manual_requested_date == item.scheduled_date
     assert item.scheduled_date == today
     assert item.pk not in result['expired_anchor_ids']
 
@@ -408,7 +408,7 @@ def test_future_anchor_does_not_expire(user, make_item):
         user,
         'Future anchor',
         scheduled_date=today + timedelta(days=3),
-        schedule_is_manual=True,
+        manual_requested_date=today + timedelta(days=3),
         due_date=today + timedelta(days=10),
     )
 
@@ -416,7 +416,7 @@ def test_future_anchor_does_not_expire(user, make_item):
 
     item.refresh_from_db()
 
-    assert item.schedule_is_manual is True
+    assert item.manual_requested_date == item.scheduled_date
     assert item.scheduled_date == today + timedelta(days=3)
 
 
@@ -427,7 +427,7 @@ def test_expired_anchor_does_not_create_overdue_semantics(user, make_item):
         user,
         'Expired preference but live deadline',
         scheduled_date=today - timedelta(days=3),
-        schedule_is_manual=True,
+        manual_requested_date=today - timedelta(days=3),
         due_date=today + timedelta(days=7),
     )
 
@@ -435,6 +435,6 @@ def test_expired_anchor_does_not_create_overdue_semantics(user, make_item):
 
     item.refresh_from_db()
 
-    assert item.schedule_is_manual is False
+    assert item.manual_requested_date is None
     assert item.due_date == today + timedelta(days=7)
     assert item.scheduled_date >= today

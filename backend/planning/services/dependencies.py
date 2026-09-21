@@ -45,6 +45,9 @@ def add(prerequisite: PlanningItem, dependent: PlanningItem):
     _validate_endpoint(prerequisite)
     _validate_endpoint(dependent)
 
+    from . import lifecycle, priority
+    priority._lock(prerequisite.user)
+
     # Lock both endpoints so concurrent graph edits cannot race validation.
     locked = {
         item.pk: item
@@ -54,6 +57,11 @@ def add(prerequisite: PlanningItem, dependent: PlanningItem):
     }
     prerequisite = locked[prerequisite.pk]
     dependent = locked[dependent.pk]
+
+    _validate_endpoint(prerequisite)
+    _validate_endpoint(dependent)
+    if dependent.is_completed and not prerequisite.is_completed:
+        raise ValidationError("Completed work cannot depend on unfinished work.")
 
     if prerequisite.pk == dependent.pk:
         raise ValidationError("A task cannot depend on itself.")
@@ -72,10 +80,13 @@ def add(prerequisite: PlanningItem, dependent: PlanningItem):
     if _would_create_cycle(prerequisite, dependent):
         raise ValidationError("This dependency would create a cycle.")
 
-    return PlanningDependency.objects.create(
+    edge = PlanningDependency.objects.create(
         prerequisite=prerequisite,
         dependent=dependent,
     )
+
+    lifecycle.finish(prerequisite.user)
+    return edge
 
 
 add_dependency = add
@@ -88,11 +99,15 @@ def remove(prerequisite: PlanningItem, dependent: PlanningItem):
     if prerequisite.user_id != dependent.user_id:
         raise ValidationError("Dependencies cannot cross users.")
 
+    from . import priority
+    priority._lock(prerequisite.user)
     deleted, _ = PlanningDependency.objects.filter(
         prerequisite=prerequisite,
         dependent=dependent,
     ).delete()
 
+    from . import lifecycle
+    lifecycle.finish(prerequisite.user)
     return bool(deleted)
 
 

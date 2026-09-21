@@ -102,9 +102,15 @@ def test_DP1_dependency_is_explicit_fact_separate_from_hierarchy_and_priority(
     b.refresh_from_db()
 
     assert b.parent_id == before_parent
-    assert b.priority_position == before_priority
+    # Blocking removes active frontier membership, while saved neighbours
+    # preserve preference. DP4 below requires immediate blocked exclusion.
+    assert b.priority_position is None
+    assert b.priority_restore_context['before'] == [a.pk]
     pre, dep = _edge_fields(model)
     assert model.objects.filter(**{f"{pre}_id": a.pk, f"{dep}_id": b.pk}).exists()
+    service.remove(a, b)
+    b.refresh_from_db()
+    assert b.priority_position == before_priority
 
 
 @covers('DEP-002')

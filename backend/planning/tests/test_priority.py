@@ -173,17 +173,12 @@ def test_renumber_repairs_a_sparse_order(user, tasks):
 # --------------------------------------------------------------------------
 
 def test_the_database_refuses_a_duplicate_position(user, tasks):
-    """Because the constraint is deferred, the duplicate is tolerated until
-    the check runs. Forcing it early is the only way to observe the rejection
-    from inside a transaction, and it doubles as proof that the deferral in
-    the migration is real."""
+    """Duplicate active positions fail on both supported database engines."""
     with pytest.raises(IntegrityError):
         with transaction.atomic():
             PlanningItem.objects.filter(pk=tasks[0].pk).update(
                 priority_position=tasks[1].priority_position
             )
-            with connection.cursor() as cursor:
-                cursor.execute('SET CONSTRAINTS ALL IMMEDIATE')
 
 
 def test_the_database_allows_many_null_positions(user, make_item):

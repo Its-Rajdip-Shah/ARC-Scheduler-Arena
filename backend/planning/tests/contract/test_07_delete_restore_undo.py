@@ -181,3 +181,122 @@ def test_D10_undo_must_validate_against_present_world_not_bulldoze_newer_facts()
         "dependency, temporal and anchor facts rather than blindly restoring "
         "an old snapshot."
     )
+
+
+@covers('DEL-002')
+def test_D2b_delete_subtree_actually_tombstones_descendants_atomically(
+    user, make_item
+):
+    from planning.services import deletion
+
+    root = make_item(user, "Delete root")
+    child = make_item(user, "Delete child", parent=root)
+    grandchild = make_item(user, "Delete grandchild", parent=child)
+
+    deletion.delete_subtree(root)
+
+    states = dict(
+        PlanningItem.objects.filter(
+            pk__in=[root.pk, child.pk, grandchild.pk]
+        ).values_list("pk", "is_deleted")
+    )
+    assert states == {
+        root.pk: True,
+        child.pk: True,
+        grandchild.pk: True,
+    }
+
+
+@covers('DEL-003', 'DEL-004')
+def test_D4b_restore_reactivates_same_rows_and_identity(user, make_item):
+    from planning.services import deletion
+
+    root = make_item(user, "Restore root")
+    child = make_item(user, "Restore child", parent=root)
+    ids = (root.pk, child.pk)
+
+    deletion.delete_subtree(root)
+    deletion.restore_subtree(root)
+
+    root.refresh_from_db()
+    child.refresh_from_db()
+
+    assert (root.pk, child.pk) == ids
+    assert root.is_deleted is False
+    assert child.is_deleted is False
+    assert child.parent_id == root.pk
+
+
+@covers('DEL-005')
+def test_D6b_restore_revalidates_complete_prospective_dependency_graph(
+    user, make_item
+):
+    """Restore validates remembered edges as one prospective graph.
+
+    The important assertion is behavioural: if the restoration set itself
+    would produce a directed cycle, restoration is rejected atomically rather
+    than blindly recreating remembered edges.
+    """
+    from django.core.exceptions import ValidationError
+    from planning.models import PlanningDependency
+    from planning.services import deletion
+
+    a = make_item(user, "A")
+    b = make_item(user, "B")
+
+    deletion.delete_subtree(a)
+
+    # Simulate durable remembered restoration intent containing two edges
+    # which are individually representable but cyclic as a complete
+    # prospective restoration graph.
+    a.refresh_from_db()
+    context = dict(a.deletion_restore_context)
+    context["dependencies"] = [
+        {
+            "prerequisite_id": a.pk,
+            "dependent_id": b.pk,
+        },
+        {
+            "prerequisite_id": b.pk,
+            "dependent_id": a.pk,
+        },
+    ]
+    a.deletion_restore_context = context
+    a.save(update_fields=["deletion_restore_context"])
+
+    with pytest.raises(ValidationError):
+        deletion.restore_subtree(a)
+
+    # Failed restoration must be atomic.
+    a.refresh_from_db()
+    assert a.is_deleted is True
+
+    assert not PlanningDependency.objects.filter(
+        prerequisite_id=a.pk,
+        dependent_id=b.pk,
+    ).exists()
+    assert not PlanningDependency.objects.filter(
+        prerequisite_id=b.pk,
+        dependent_id=a.pk,
+    ).exists()
+
+
+@covers('DEL-005')
+def test_D7b_restore_expires_past_anchor_behaviourally(
+    user, make_item, today
+):
+    from datetime import timedelta
+    from planning.services import deletion
+
+    old_day = today - timedelta(days=2)
+    item = make_item(
+        user,
+        "Expired anchor",
+        manual_requested_date=old_day,
+    )
+
+    deletion.delete_subtree(item)
+    deletion.restore_subtree(item, today=today)
+
+    item.refresh_from_db()
+    assert item.manual_requested_date is None

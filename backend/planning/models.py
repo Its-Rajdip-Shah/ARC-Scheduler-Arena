@@ -180,14 +180,14 @@ class PlanningItem(OwnedModel, TimestampedModel):
     due_date = models.DateField(null=True, blank=True)
     # Planned execution date, independent of release/deadline constraints.
     scheduled_date = models.DateField(null=True, blank=True)
+    execution_rank = models.PositiveIntegerField(null=True, blank=True)
 
-    # Canonical explicit user date intent. This is deliberately distinct from
+    # Canonical user date intent lives exclusively in manual_requested_date.
+    # This is deliberately distinct from
     # scheduled_date, which is a disposable scheduler proposal.
     manual_requested_date = models.DateField(null=True, blank=True)
-
-    # Legacy execution-placement marker retained temporarily while the anchor
-    # lifecycle is migrated onto manual_requested_date in the anchor cluster.
-    schedule_is_manual = models.BooleanField(default=False)
+    # Last missed explicit intent, retained for recovery after hard expiry.
+    expired_manual_requested_date = models.DateField(null=True, blank=True)
 
     priority_restore_context = models.JSONField(default=dict, blank=True)
 
@@ -234,18 +234,11 @@ class PlanningItem(OwnedModel, TimestampedModel):
         db_table = 'planning_items'
         ordering = ['sibling_order', 'id']
         constraints = [
-            # FR-09: one global priority order per user, each active task in
-            # exactly one row. No condition= is needed because Postgres treats
-            # NULLs as distinct, so any number of completed or non-actionable
-            # items can sit at NULL. Deferring the check to COMMIT is what lets
-            # the Phase 4 reorder renumber rows in a single bulk_update instead
-            # of shuffling them through a temporary offset range; a condition=
-            # would rule deferral out, since Postgres cannot defer a partial
-            # index.
+            # Immediate uniqueness is enforced on SQLite and PostgreSQL.
+            # Priority commands release affected slots before a permutation.
             models.UniqueConstraint(
                 fields=['user', 'priority_position'],
                 name='uniq_user_priority_position',
-                deferrable=models.Deferrable.DEFERRED,
             ),
             # FR-05: re-syncing Canvas updates these rows instead of
             # duplicating them.
@@ -263,6 +256,10 @@ class PlanningItem(OwnedModel, TimestampedModel):
             models.CheckConstraint(
                 condition=Q(priority_position__gte=1) | Q(priority_position__isnull=True),
                 name='planning_item_priority_position_positive',
+            ),
+            models.CheckConstraint(
+                condition=Q(percent_completed__gte=0) & Q(percent_completed__lte=100),
+                name='planning_item_percent_completed_range',
             ),
         ]
 
@@ -353,13 +350,11 @@ class SchedulerAllocation(models.Model):
 
 
 class ProgressSegment(models.Model):
-    """Durable identity for a confirmed or proposed slice of splittable work.
+    """Durable canonical history for confirmed splittable-work progress.
 
-    A segment is NOT a PlanningItem and therefore never participates in the
-    semantic parent/child hierarchy.
-
-    Unconfirmed rows may be replaced by future scheduler proposals.
-    Confirmed rows become durable canonical progress history.
+    A ProgressSegment is never a scheduler proposal and never participates in
+    the PlanningItem hierarchy. Disposable future proposals live exclusively
+    in SchedulerAllocation.
     """
 
     item = models.ForeignKey(
@@ -379,6 +374,10 @@ class ProgressSegment(models.Model):
             models.CheckConstraint(
                 condition=Q(percentage__gt=0) & Q(percentage__lte=100),
                 name='progress_segment_percentage_range',
+            ),
+            models.CheckConstraint(
+                condition=Q(is_completed=True),
+                name='progress_segment_must_be_confirmed',
             ),
         ]
 
@@ -505,16 +504,6 @@ class Timezone(OwnedModel):
 
     def __str__(self):
         return f'{self.title} ({self.start_date} to {self.end_date})'
-
-
-class SchedulingPreference(OwnedModel):
-    """Normal daily slot capacity for each duration bucket."""
-    under_20 = models.PositiveSmallIntegerField(default=5)
-    minutes_20_to_60 = models.PositiveSmallIntegerField(default=4)
-    over_60 = models.PositiveSmallIntegerField(default=3)
-
-    class Meta:
-        constraints = [models.UniqueConstraint(fields=['user'], name='uniq_scheduling_preferences_user')]
 
 
 class SchedulingOverload(OwnedModel):

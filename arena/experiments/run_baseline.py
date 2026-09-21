@@ -107,7 +107,7 @@ def main():
             print()
             print(current_date)
 
-        anchor = " ⚓" if item.schedule_is_manual else ""
+        anchor = " ⚓" if item.manual_requested_date is not None else ""
         priority = (
             f"P{item.priority_position}"
             if item.priority_position is not None

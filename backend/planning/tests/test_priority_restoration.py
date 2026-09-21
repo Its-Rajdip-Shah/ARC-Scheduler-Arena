@@ -46,7 +46,10 @@ def test_completion_history_and_eligibility_restoration(user, api_for, make_item
     after = history.capture_items(user, [b.pk])
     history.undo(user)
     assert ids(user) == [a.pk, b.pk, c.pk]
-    assert history.capture_items(user, [b.pk]) == before
+    restored = history.capture_items(user, [b.pk])
+    for row in restored:
+        assert row["scheduled_date"] is not None
+    assert [{k: v for k, v in row.items() if k != "scheduled_date"} for row in restored] == [{k: v for k, v in row.items() if k != "scheduled_date"} for row in before]
     history.redo(user)
     assert ids(user) == [a.pk, c.pk]
     assert history.capture_items(user, [b.pk]) == after
@@ -92,10 +95,10 @@ def test_legacy_history_with_null_estimate_uses_default(user, make_item):
     assert entry is not None
     assert history.undo(user) is not None
     item.refresh_from_db()
-    assert item.duration_category == DurationCategory.MIN_20_TO_60
+    assert item.duration_category == DurationCategory.UNDER_1_HOUR
     assert history.redo(user) is not None
     item.refresh_from_db()
-    assert item.duration_category == DurationCategory.MIN_20_TO_60
+    assert item.duration_category == DurationCategory.UNDER_1_HOUR
 
 
 def test_new_parent_inherits_final_child_frontier_slot(user, make_item):

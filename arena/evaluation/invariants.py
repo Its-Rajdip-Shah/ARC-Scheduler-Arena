@@ -77,7 +77,7 @@ def validate_schedule(
                 )
             )
 
-        if not item.schedule_is_manual and item.scheduled_date < benchmark_today:
+        if item.manual_requested_date is None and item.scheduled_date < benchmark_today:
             violations.append(
                 Violation(
                     "scheduled_in_past",

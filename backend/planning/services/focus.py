@@ -13,6 +13,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
 
+from django.db import transaction
+from django.utils import timezone
 from planning.models import PlanningItem
 from planning.services import dependencies, priority, scheduling
 
@@ -31,6 +33,7 @@ class FocusCandidate:
     duration_category: str | None
     scheduled_date: date | None
     priority_position: int | None
+    execution_rank: int | None = None
     is_current: bool = False
 
 
@@ -39,7 +42,7 @@ def _ordered_candidates(user):
 
     rows = (
         PlanningItem.objects.for_user(user)
-        .actionable()
+        .priority_eligible()
         .filter(
             is_completed=False,
             is_deleted=False,
@@ -57,14 +60,15 @@ def _ordered_candidates(user):
                 duration_category=item.duration_category,
                 scheduled_date=item.scheduled_date,
                 priority_position=item.priority_position,
+                execution_rank=item.execution_rank,
                 is_current=item.pk == current_id,
             )
-            for item in rows
+            for item in rows if not dependencies.is_blocked(item)
         ),
         key=lambda candidate: (
             candidate.scheduled_date,
-            candidate.priority_position is None,
-            candidate.priority_position or 0,
+            candidate.execution_rank is None,
+            candidate.execution_rank or candidate.priority_position or 0,
             candidate.item_id,
         ),
     )
@@ -77,6 +81,7 @@ def build(user, today=None):
     visible as look-ahead choices; merely viewing them does not move them.
     """
 
+    reconcile_current(user)
     candidates = _ordered_candidates(user)
     grouped = defaultdict(list)
 
@@ -117,7 +122,7 @@ def set_current(user, item):
         return None
 
     _CURRENT_BY_USER[user.pk] = item_id
-    return item_id
+    return reconcile_current(user)
 
 
 select = set_current
@@ -163,6 +168,7 @@ demote = return_to_automatic
 clear_do_today = return_to_automatic
 
 
+@transaction.atomic
 def reprioritise(user, item, new_position):
     """Explicit Focus reprioritisation crosses global Priority authority."""
 
@@ -203,6 +209,7 @@ def reconcile_current(user):
         and not item.is_deleted
         and not item.is_completed
         and item.is_actionable
+        and (item.start_date is None or item.start_date <= timezone.localdate())
         and not item.children.filter(
             is_deleted=False,
             is_completed=False,

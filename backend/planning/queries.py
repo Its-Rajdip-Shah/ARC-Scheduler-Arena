@@ -46,27 +46,6 @@ SELECT planning_item_id FROM chain WHERE depth > 0 ORDER BY depth
 """
 
 
-_TREE_SQL = """
-WITH RECURSIVE tree AS (
-    SELECT planning_item_id, 0 AS depth,
-           ARRAY[sibling_order, planning_item_id] AS path
-      FROM planning_items
-     WHERE user_id = %(user_id)s
-       AND parent_id IS NULL
-       AND is_deleted = FALSE
-    UNION ALL
-    SELECT child.planning_item_id, tree.depth + 1,
-           tree.path || ARRAY[child.sibling_order, child.planning_item_id]
-      FROM planning_items AS child
-      JOIN tree ON child.parent_id = tree.planning_item_id
-     WHERE child.user_id = %(user_id)s
-       AND child.is_deleted = FALSE
-       AND tree.depth < %(max_depth)s
-)
-SELECT planning_item_id, depth FROM tree ORDER BY path
-"""
-
-
 def tree_rows(user_id):
     """[(item_id, depth)] for the user's whole hierarchy, in display order.
 
@@ -74,9 +53,24 @@ def tree_rows(user_id):
     its parent, so the Text View can render the indentation straight from
     ``depth`` without sorting anything itself.
     """
-    with connection.cursor() as cursor:
-        cursor.execute(_TREE_SQL, {'user_id': user_id, 'max_depth': MAX_DEPTH})
-        return cursor.fetchall()
+    from collections import defaultdict
+    from planning.models import PlanningItem
+
+    children = defaultdict(list)
+    for pk, parent in PlanningItem.objects.for_user(user_id).order_by(
+        'sibling_order', 'pk'
+    ).values_list('pk', 'parent_id'):
+        children[parent].append(pk)
+    rows, visited = [], set()
+    stack = [(pk, 0) for pk in reversed(children[None])]
+    while stack:
+        pk, depth = stack.pop()
+        if pk in visited or depth > MAX_DEPTH:
+            continue
+        visited.add(pk)
+        rows.append((pk, depth))
+        stack.extend((child, depth + 1) for child in reversed(children[pk]))
+    return rows
 
 
 def _run(sql, user_id, item_id):

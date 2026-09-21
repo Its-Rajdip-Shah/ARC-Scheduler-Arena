@@ -17,7 +17,7 @@ import pytest
 from django.core.exceptions import ValidationError
 
 from planning.models import PlanningItem
-from planning.services import hierarchy, priority
+from planning.services import deletion, dependencies, hierarchy, priority, scheduling
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -251,3 +251,77 @@ def test_RT_006_failed_transition_does_not_break_future_inverse_round_trip(
         "RT-006: an earlier rejected transition poisoned a later valid "
         "complete/reopen round trip"
     )
+
+
+@covers('RT-005', 'RT-006')
+def test_RT_005_006_cross_domain_lifecycle_torture(user, make_item, today):
+    """Compose hierarchy, priority, dependency, anchor, delete/restore and
+    scheduler transitions repeatedly and assert hard invariants after each.
+    """
+    from datetime import timedelta
+
+    rng = random.Random(3610)
+    items = [make_item(user, f"Cross {i}") for i in range(8)]
+    priority.reconcile(user)
+
+    for step in range(60):
+        item = rng.choice(items)
+        item.refresh_from_db()
+
+        op = rng.choice((
+            "complete",
+            "reopen",
+            "dependency",
+            "anchor",
+            "unanchor",
+            "delete_restore",
+            "priority",
+            "schedule",
+        ))
+
+        try:
+            if op == "complete" and not item.is_deleted:
+                hierarchy.complete_subtree(item)
+
+            elif op == "reopen" and not item.is_deleted:
+                hierarchy.reopen(item)
+
+            elif op == "dependency":
+                other = rng.choice([x for x in items if x.pk != item.pk])
+                other.refresh_from_db()
+                if not item.is_deleted and not other.is_deleted:
+                    try:
+                        dependencies.add(item, other)
+                    except (ValidationError, ValueError):
+                        pass
+
+            elif op == "anchor" and not item.is_deleted and not item.is_completed:
+                try:
+                    scheduling.set_anchor(
+                        item,
+                        today + timedelta(days=rng.randint(0, 4)),
+                        change_deadline=True,
+                        change_release=True,
+                    )
+                except (ValidationError, scheduling.SchedulingConflict):
+                    pass
+
+            elif op == "unanchor" and not item.is_deleted:
+                scheduling.remove_anchor(item)
+
+            elif op == "delete_restore" and not item.is_deleted:
+                deletion.delete_subtree(item)
+                deletion.restore_subtree(item, today=today)
+
+            elif op == "priority":
+                priority.reconcile(user)
+
+            elif op == "schedule":
+                scheduling.schedule(user, today)
+
+        except (ValidationError, ValueError, scheduling.SchedulingConflict):
+            # Rejected transitions are legal; they must not poison state.
+            pass
+
+        priority.reconcile(user)
+        _assert_all(user)

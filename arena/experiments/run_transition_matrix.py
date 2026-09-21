@@ -17,7 +17,7 @@ import django
 django.setup()
 
 from accounts.models import User
-from planning.models import PlanningItem, SchedulingPreference
+from planning.models import PlanningItem
 from planning.services import hierarchy, scheduling
 
 from arena.evaluation.invariants import execution_frontier, validate_schedule
@@ -28,19 +28,11 @@ TODAY = date(2026, 9, 20)
 
 def reset():
     PlanningItem.objects.all().delete()
-    SchedulingPreference.objects.all().delete()
     User.objects.filter(email="certification@arena.test").delete()
 
     user = User.objects.create_user(
         email="certification@arena.test",
         password="arena-local-only",
-    )
-
-    SchedulingPreference.objects.create(
-        user=user,
-        under_20=5,
-        minutes_20_to_60=4,
-        over_60=3,
     )
 
     return user
@@ -66,7 +58,7 @@ def make(
         item_type=kind,
         is_completed=completed,
         is_deleted=deleted,
-        schedule_is_manual=manual,
+        manual_requested_date=scheduled if manual else None,
         scheduled_date=scheduled,
         start_date=release,
         due_date=due or TODAY + timedelta(days=30),
@@ -77,9 +69,9 @@ def run_and_assert(user):
     anchors = dict(
         PlanningItem.objects.filter(
             user=user,
-            schedule_is_manual=True,
+            manual_requested_date__isnull=False,
             is_deleted=False,
-        ).values_list("id", "scheduled_date")
+        ).values_list("id", "manual_requested_date")
     )
 
     completed = dict(
@@ -370,8 +362,8 @@ def test_unanchor_returns_item_to_scheduler():
 
     run_and_assert(u)
 
-    t.schedule_is_manual = False
-    t.save(update_fields=["schedule_is_manual"])
+    t.manual_requested_date = None
+    t.save(update_fields=["manual_requested_date"])
 
     run_and_assert(u)
     t.refresh_from_db()

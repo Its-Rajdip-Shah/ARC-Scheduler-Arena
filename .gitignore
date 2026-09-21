@@ -1,37 +1,36 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Virtual environments
 .venv/
 venv/
-env/
 
-# Secrets / environment
+# Local databases
+*.sqlite3
+*.sqlite3-journal
+
+# Environment / secrets
 .env
 .env.*
 !.env.example
 
-# Databases
-db.sqlite3
-*.sqlite3
-
-# Testing / coverage
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-
-# Arena generated results
-arena/results/
-arena/artifacts/
-arena/reports/generated/
-
-# Logs
-*.log
-
-# IDE / OS
+# macOS
 .DS_Store
-.idea/
+
+# Temporary / backup artifacts
+*.bak
+*.cluster2.bak
+*.pre_final_hardening.bak
+*.zip
+contract.backup/
+contract_test_backup_DO_NOT_COLLECT/
+cluster*_backup_*/
+
+# Editors
 .vscode/
+.idea/

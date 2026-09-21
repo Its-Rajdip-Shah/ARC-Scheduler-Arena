@@ -107,7 +107,7 @@ class Command(BaseCommand):
         report = self._item(
             user, ItemType.ASSIGNMENT, 'Submit system design report',
             parent=assignment_2, due_date=today - timedelta(days=12),
-            duration='OVER_60_MIN',
+            duration='UNDER_4_HOURS',
             canvas_object_type=CanvasObjectType.ASSIGNMENT, canvas_object_id='canvas-a2-101',
         )
         AssignmentDetail.objects.create(
@@ -119,18 +119,18 @@ class Command(BaseCommand):
         # 3 days past due: Recent under FR-12.
         erd = self._item(
             user, ItemType.TASK, 'Draft the ERD', parent=assignment_2,
-            due_date=today - timedelta(days=3), duration='OVER_60_MIN',
+            due_date=today - timedelta(days=3), duration='UNDER_4_HOURS',
         )
 
         # No due_date, so FR-11 schedules it and FR-12 can never call it overdue.
         wireframes = self._item(
             user, ItemType.TASK, 'Review wireframes', parent=assignment_2,
-            scheduled_date=today + timedelta(days=1), duration='MIN_20_TO_60',
+            scheduled_date=today + timedelta(days=1), duration='UNDER_1_HOUR',
         )
 
         quiz = self._item(
             user, ItemType.ASSIGNMENT, 'Quiz 3', parent=elec,
-            due_date=today + timedelta(days=5), duration='UNDER_20_MIN',
+            due_date=today + timedelta(days=5), duration='UNDER_20_MINUTES',
         )
         AssignmentDetail.objects.create(
             planning_item=quiz, weight_percent='10.00', mark_achieved='8.50',
@@ -140,15 +140,15 @@ class Command(BaseCommand):
         maths = self._item(user, ItemType.GOAL, 'MATH2021 Vector Calculus')
         problem_set = self._item(
             user, ItemType.TASK, 'Weekly problem set', parent=maths,
-            start_date=today, due_date=today + timedelta(days=2), duration='OVER_60_MIN',
+            start_date=today, due_date=today + timedelta(days=2), duration='UNDER_4_HOURS',
         )
         revision = self._item(
             user, ItemType.TASK, "Revise Green's theorem", parent=maths,
-            scheduled_date=today + timedelta(days=3), duration='MIN_20_TO_60',
+            scheduled_date=today + timedelta(days=3), duration='UNDER_1_HOUR',
         )
         final = self._item(
             user, ItemType.ASSIGNMENT, 'Final exam', parent=maths,
-            due_date=today + timedelta(days=45), duration='OVER_60_MIN',
+            due_date=today + timedelta(days=45), duration='UNDER_4_HOURS',
         )
         AssignmentDetail.objects.create(
             planning_item=final, weight_percent='60.00', mark_achieved=None,
@@ -159,7 +159,7 @@ class Command(BaseCommand):
         # deferred unique constraint is there to protect.
         self._item(
             user, ItemType.TASK, 'Set up dev environment', parent=elec,
-            is_completed=True, duration='MIN_20_TO_60',
+            is_completed=True, duration='UNDER_1_HOUR',
         )
 
         for item, names in (
@@ -177,7 +177,8 @@ class Command(BaseCommand):
             item.priority_position = position
         PlanningItem.objects.bulk_update(ordered, ['priority_position'])
 
-        scheduling.schedule(user)
+        from planning.services import lifecycle
+        lifecycle.finish(user)
 
         # Only alice gets Canvas, so the "never connected" path stays covered.
         if user.email == DEMO_USERS[0]:
@@ -198,7 +199,7 @@ class Command(BaseCommand):
                 error_message='Canvas returned 401: invalid access token.',
             )
 
-    def _item(self, user, item_type, title, parent=None, duration='MIN_20_TO_60', **fields):
+    def _item(self, user, item_type, title, parent=None, duration='UNDER_1_HOUR', **fields):
         siblings = PlanningItem.objects.filter(user=user, parent=parent).count()
         return PlanningItem.objects.create(
             user=user,

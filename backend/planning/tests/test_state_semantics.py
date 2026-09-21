@@ -280,7 +280,7 @@ def _semantic_item(user, title="Original", **overrides):
     values = {
         "title": title,
         "item_type": ItemType.TASK,
-        "duration_category": DurationCategory.MIN_20_TO_60,
+        "duration_category": DurationCategory.UNDER_1_HOUR,
         "start_date": date(2026, 9, 22),
         "due_date": date(2026, 10, 10),
         "is_completed": False,
@@ -326,14 +326,14 @@ def test_duration_edit_preserves_unrelated_factual_data(semantic_user):
     item = _semantic_item(semantic_user)
     before = _factual_snapshot(item)
 
-    item.duration_category = DurationCategory.OVER_60_MIN
+    item.duration_category = DurationCategory.UNDER_4_HOURS
     item.save(update_fields=["duration_category"])
 
     after = _factual_snapshot(item)
 
     assert after == {
         **before,
-        "duration_category": DurationCategory.OVER_60_MIN,
+        "duration_category": DurationCategory.UNDER_4_HOURS,
     }
 
 
@@ -380,9 +380,9 @@ def test_repeated_factual_edits_do_not_accumulate_semantic_drift(semantic_user):
     for i in range(50):
         item.title = f"Temporary {i}"
         item.duration_category = (
-            DurationCategory.OVER_60_MIN
+            DurationCategory.UNDER_4_HOURS
             if i % 2
-            else DurationCategory.UNDER_20_MIN
+            else DurationCategory.UNDER_20_MINUTES
         )
         item.start_date = date(2026, 9, 22) + timedelta(days=i % 5)
         item.due_date = date(2026, 10, 10) + timedelta(days=i % 7)
@@ -418,7 +418,7 @@ def test_title_change_is_scheduler_metamorphic(semantic_user):
 
     before = (
         item.scheduled_date,
-        item.schedule_is_manual,
+        item.manual_requested_date,
         item.priority_position,
     )
 
@@ -430,7 +430,7 @@ def test_title_change_is_scheduler_metamorphic(semantic_user):
 
     after = (
         item.scheduled_date,
-        item.schedule_is_manual,
+        item.manual_requested_date,
         item.priority_position,
     )
 
@@ -466,7 +466,7 @@ def _semantic_state(item):
 
         # Scheduling-derived state
         "scheduled_date": item.scheduled_date,
-        "schedule_is_manual": item.schedule_is_manual,
+        "manual_requested_date": item.manual_requested_date,
         "priority_position": item.priority_position,
         "priority_restore_context": item.priority_restore_context,
     }
@@ -601,7 +601,7 @@ def test_final_child_completion_exposes_parent_without_factual_damage(
         semantic_user,
         "Large assignment",
         item_type=ItemType.ASSIGNMENT,
-        duration_category=DurationCategory.OVER_60_MIN,
+        duration_category=DurationCategory.UNDER_4_HOURS,
         start_date=today,
         due_date=today + timedelta(days=14),
     )
@@ -709,7 +709,7 @@ def test_reparent_subtree_preserves_descendant_meaning(semantic_user):
         semantic_user,
         "Deep leaf",
         parent=branch,
-        duration_category=DurationCategory.OVER_60_MIN,
+        duration_category=DurationCategory.UNDER_4_HOURS,
         start_date=today + timedelta(days=1),
         due_date=today + timedelta(days=12),
     )
@@ -810,7 +810,7 @@ def test_complete_subtree_changes_only_lifecycle_not_factual_meaning(
         semantic_user,
         "Child",
         parent=parent,
-        duration_category=DurationCategory.OVER_60_MIN,
+        duration_category=DurationCategory.UNDER_4_HOURS,
         start_date=today + timedelta(days=1),
         due_date=today + timedelta(days=10),
     )
@@ -939,7 +939,7 @@ def test_priority_neighbourhood_survives_frontier_departure_and_return(
     c = _semantic_item(semantic_user, "C", start_date=today)
 
     # Raw test construction bypasses ARC's normal scheduling boundary.
-    # Production schedule() always reconciles priority eligibility first.
+    # Domain mutations reconcile priority; scheduler runs never own it.
     priority.reconcile(semantic_user)
 
     priority.reorder(semantic_user, a.pk, 1)
@@ -959,6 +959,7 @@ def test_priority_neighbourhood_survives_frontier_departure_and_return(
         parent=b,
         start_date=today,
     )
+    priority.reconcile(semantic_user)
     scheduling.schedule(semantic_user, today=today, mode="global")
 
     b.refresh_from_db()
@@ -988,7 +989,7 @@ def test_repeated_priority_frontier_round_trip_has_no_order_drift(
     c = _semantic_item(semantic_user, "C", start_date=today)
 
     # Raw test construction bypasses ARC's normal scheduling boundary.
-    # Production schedule() always reconciles priority eligibility first.
+    # Domain mutations reconcile priority; scheduler runs never own it.
     priority.reconcile(semantic_user)
 
     priority.reorder(semantic_user, a.pk, 1)
@@ -1050,7 +1051,7 @@ def test_delete_restore_round_trip_preserves_factual_meaning(
         semantic_user,
         "Round trip",
         description="Must survive",
-        duration_category=DurationCategory.OVER_60_MIN,
+        duration_category=DurationCategory.UNDER_4_HOURS,
         start_date=date(2026, 9, 25),
         due_date=date(2026, 10, 8),
     )

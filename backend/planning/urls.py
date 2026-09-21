@@ -23,7 +23,6 @@ urlpatterns = [
     path('timeline/reschedule/', views.ScheduleRescheduleView.as_view(), name='schedule-reschedule'),
     path('timeline/move/', views.ScheduleMoveView.as_view(), name='schedule-move'),
     path('timeline/replace/', views.ScheduleReplaceView.as_view(), name='schedule-replace'),
-    path('timeline/capacity/', views.ScheduleCapacityView.as_view(), name='schedule-capacity'),
     path('timeline/overload/', views.ScheduleOverloadView.as_view(), name='schedule-overload'),
     path('timeline/', views.TimelineView.as_view(), name='timeline'),
     path('overdue/', views.OverdueView.as_view(), name='overdue'),

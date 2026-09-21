@@ -49,6 +49,7 @@ def delete_subtree(item: PlanningItem):
     """Atomically tombstone an item and its currently active subtree."""
 
     item = _coerce_item(item)
+    priority._lock(item.user)
 
     root = (
         PlanningItem.objects
@@ -161,8 +162,8 @@ def delete_subtree(item: PlanningItem):
         )
         hierarchy.reindex_siblings(root.user, parent)
 
-    priority.reconcile(root.user)
-    scheduling.schedule(root.user)
+    from . import lifecycle
+    lifecycle.finish(root.user)
 
     root.refresh_from_db()
     return root
@@ -278,18 +279,37 @@ def _validate_dependency_restore(edge_states, user, restoring_ids):
 
         return False
 
-    for prerequisite, dependent in candidates:
-        # Temporarily ignore the candidate's direct edge while asking whether
-        # the dependent can otherwise reach its prerequisite.
-        graph[prerequisite.pk].discard(dependent.pk)
-        cyclic = reaches(dependent.pk, prerequisite.pk)
-        graph[prerequisite.pk].add(dependent.pk)
+    # Validate the complete prospective graph, including interactions among
+    # multiple remembered edges.  A directed graph is valid iff DFS finds no
+    # back-edge.
+    visiting = set()
+    visited = set()
 
-        if cyclic:
-            raise ValidationError(
-                "Restoring the original dependency would create a cycle in "
-                "the present dependency graph."
-            )
+    def visit(node):
+        if node in visiting:
+            return True
+        if node in visited:
+            return False
+
+        visiting.add(node)
+
+        for nxt in graph.get(node, ()):
+            if visit(nxt):
+                return True
+
+        visiting.remove(node)
+        visited.add(node)
+        return False
+
+    nodes = set(graph)
+    for targets in graph.values():
+        nodes.update(targets)
+
+    if any(visit(node) for node in nodes if node not in visited):
+        raise ValidationError(
+            "Restoring the original dependencies would create a cycle in "
+            "the present dependency graph."
+        )
 
     return candidates
 
@@ -299,6 +319,7 @@ def restore_subtree(item: PlanningItem, *, today=None):
     """Restore a deleted subtree only when remembered semantics remain valid."""
 
     item = _coerce_item(item)
+    priority._lock(item.user)
     today = today or timezone.localdate()
 
     root = (
@@ -392,8 +413,8 @@ def restore_subtree(item: PlanningItem, *, today=None):
             # D7: a missed historical anchor is not resurrected as a new hard
             # current commitment merely because the task was restored later.
             if anchor_day < today:
+                row.expired_manual_requested_date = anchor_day
                 row.manual_requested_date = None
-                row.schedule_is_manual = False
             else:
                 row.manual_requested_date = anchor_day
 
@@ -406,7 +427,7 @@ def restore_subtree(item: PlanningItem, *, today=None):
             "parent",
             "sibling_order",
             "manual_requested_date",
-            "schedule_is_manual",
+            "expired_manual_requested_date",
         ],
     )
 
@@ -431,8 +452,11 @@ def restore_subtree(item: PlanningItem, *, today=None):
         )
         hierarchy.reindex_siblings(root.user, parent)
 
-    priority.reconcile(root.user)
-    scheduling.schedule(root.user, today)
+    from . import lifecycle
+    for row in rows:
+        if not row.is_completed:
+            lifecycle.reopen_ancestors(row)
+    lifecycle.finish(root.user, today)
 
     root.refresh_from_db()
     return root

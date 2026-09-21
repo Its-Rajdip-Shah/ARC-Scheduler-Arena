@@ -20,7 +20,7 @@ def _decimal(value):
 
 
 @transaction.atomic
-def set_duration(item: PlanningItem, category: str):
+def set_duration(item: PlanningItem, category: str, *, reconcile=True):
     """Change duration category while preserving frozen progress semantics.
 
     splittable -> splittable:
@@ -47,6 +47,8 @@ def set_duration(item: PlanningItem, category: str):
         if category not in valid:
             raise ValidationError({"duration_category": "Unknown ARC duration category."})
 
+    from . import lifecycle
+    item = lifecycle.active(item)
     old = item.duration_category
 
     atomic_values = {str(v) for v in ATOMIC_DURATION_CATEGORIES}
@@ -75,7 +77,13 @@ def set_duration(item: PlanningItem, category: str):
         update_fields.append("percent_completed")
         ProgressSegment.objects.filter(item=item).delete()
 
+    if becomes_split and item.is_completed and item.percent_completed != 100:
+        item.percent_completed = Decimal('100')
+        update_fields.append('percent_completed')
+        ProgressSegment.objects.create(item=item, percentage=100, is_completed=True, completed_at=timezone.now())
     item.save(update_fields=update_fields)
+    if reconcile:
+        lifecycle.finish(item.user)
     return item
 
 
@@ -93,6 +101,8 @@ def complete_segment(segment):
     Passing an existing ProgressSegment remains supported for compatibility.
     """
 
+    from . import priority
+    priority._lock(segment.item.user)
     if isinstance(segment, SchedulerAllocation):
         allocation = (
             SchedulerAllocation.objects
@@ -114,6 +124,10 @@ def complete_segment(segment):
                 "Atomic work cannot confirm partial allocations."
             )
 
+        from . import lifecycle, dependencies
+        item = lifecycle.active(item)
+        if item.is_completed or item.children.filter(is_deleted=False, is_completed=False).exists() or dependencies.is_blocked(item):
+            raise ValidationError('Only executable work may confirm progress.')
         remaining = Decimal("100") - _decimal(item.percent_completed)
         amount = min(_decimal(allocation.percentage), remaining)
 
@@ -150,63 +164,11 @@ def complete_segment(segment):
         # replaced by canonical progress history.
         allocation.delete()
 
+        lifecycle.finish(item.user)
         return canonical
 
-    segment = (
-        ProgressSegment.objects
-        .select_for_update()
-        .select_related("item")
-        .get(pk=segment.pk)
-    )
-
-    item = (
-        PlanningItem.objects
-        .select_for_update()
-        .get(pk=segment.item_id)
-    )
-
-    if segment.is_completed:
-        return segment
-
-    if item.duration_category not in {
-        str(v) for v in SPLITTABLE_DURATION_CATEGORIES
-    }:
-        raise ValidationError(
-            "Atomic work cannot confirm partial progress segments."
-        )
-
-    remaining = Decimal("100") - _decimal(item.percent_completed)
-    amount = min(_decimal(segment.percentage), remaining)
-
-    segment.percentage = amount
-    segment.is_completed = True
-    segment.completed_at = timezone.now()
-    segment.save(
-        update_fields=[
-            "percentage",
-            "is_completed",
-            "completed_at",
-        ]
-    )
-
-    item.percent_completed = min(
-        Decimal("100"),
-        _decimal(item.percent_completed) + amount,
-    )
-
-    if item.percent_completed >= Decimal("100"):
-        item.percent_completed = Decimal("100")
-        item.is_completed = True
-        item.save(
-            update_fields=[
-                "percent_completed",
-                "is_completed",
-            ]
-        )
-    else:
-        item.save(update_fields=["percent_completed"])
-
-    return segment
+    # Confirmed history is idempotent; it can never serve as a proposal.
+    return ProgressSegment.objects.get(pk=segment.pk, item__user=segment.item.user)
 
 
 complete_allocation = complete_segment
@@ -217,6 +179,8 @@ record_completed_allocation = complete_segment
 @transaction.atomic
 def reopen_segment(segment: ProgressSegment):
     """Reverse exactly one confirmed segment without disturbing the others."""
+    from . import priority
+    priority._lock(segment.item.user)
     segment = ProgressSegment.objects.select_for_update().select_related("item").get(
         pk=segment.pk
     )
@@ -232,9 +196,13 @@ def reopen_segment(segment: ProgressSegment):
     item.is_completed = False
     item.save(update_fields=["percent_completed", "is_completed"])
 
-    segment.is_completed = False
-    segment.completed_at = None
-    segment.save(update_fields=["is_completed", "completed_at"])
+    # Reversed records leave active accounting; no unconfirmed proposal rows.
+    from . import lifecycle
+    if item.is_deleted:
+        raise ValidationError('Restore work before reversing progress.')
+    segment.delete()
+    lifecycle.reopen_ancestors(item)
+    lifecycle.finish(item.user)
 
     return segment
 

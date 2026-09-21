@@ -18,7 +18,7 @@ import django
 django.setup()
 
 from accounts.models import User
-from planning.models import PlanningItem, SchedulingPreference
+from planning.models import PlanningItem
 from planning.services import hierarchy, scheduling
 
 from arena.evaluation.invariants import validate_schedule
@@ -33,19 +33,11 @@ INITIAL_ITEMS = 20
 
 def reset(seed):
     PlanningItem.objects.all().delete()
-    SchedulingPreference.objects.all().delete()
     User.objects.filter(email="torture@arena.test").delete()
 
     user = User.objects.create_user(
         email="torture@arena.test",
         password="arena-local-only",
-    )
-
-    SchedulingPreference.objects.create(
-        user=user,
-        under_20=5,
-        minutes_20_to_60=4,
-        over_60=3,
     )
 
     rng = random.Random(seed)
@@ -93,9 +85,9 @@ def reschedule_and_validate(user):
     anchors = dict(
         PlanningItem.objects.filter(
             user=user,
-            schedule_is_manual=True,
+            manual_requested_date__isnull=False,
             is_deleted=False,
-        ).values_list("id", "scheduled_date")
+        ).values_list("id", "manual_requested_date")
     )
 
     completed = dict(
@@ -153,7 +145,7 @@ def op_reopen(user, rng):
 def op_add_child(user, rng):
     candidates = [
         x for x in active(user)
-        if not x.is_completed and not x.schedule_is_manual
+        if not x.is_completed and x.manual_requested_date is None
     ]
     if not candidates:
         return "add_child:no-op"
@@ -174,7 +166,7 @@ def op_add_child(user, rng):
 def op_delete(user, rng):
     candidates = [
         x for x in active(user)
-        if not x.schedule_is_manual
+        if x.manual_requested_date is None
     ]
     if not candidates:
         return "delete:no-op"
@@ -191,7 +183,7 @@ def op_restore(user, rng):
         PlanningItem.objects.filter(
             user=user,
             is_deleted=True,
-            schedule_is_manual=False,
+            manual_requested_date__isnull=True,
         )
     )
 
@@ -208,7 +200,7 @@ def op_restore(user, rng):
 def op_reparent(user, rng):
     candidates = [
         x for x in active(user)
-        if not x.is_completed and not x.schedule_is_manual
+        if not x.is_completed and x.manual_requested_date is None
     ]
 
     if len(candidates) < 2:
@@ -233,7 +225,7 @@ def op_reparent(user, rng):
 def op_change_release(user, rng):
     candidates = [
         x for x in active(user)
-        if not x.is_completed and not x.schedule_is_manual
+        if not x.is_completed and x.manual_requested_date is None
     ]
     if not candidates:
         return "release:no-op"
@@ -252,7 +244,7 @@ def op_change_release(user, rng):
 def op_change_due(user, rng):
     candidates = [
         x for x in active(user)
-        if not x.is_completed and not x.schedule_is_manual
+        if not x.is_completed and x.manual_requested_date is None
     ]
     if not candidates:
         return "due:no-op"

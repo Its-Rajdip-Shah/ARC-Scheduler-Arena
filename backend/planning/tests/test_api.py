@@ -355,7 +355,7 @@ def test_reopening_a_task_returns_it_to_the_priority_order(client, user, make_it
 def test_priority_lists_active_tasks_in_order_with_their_root(client, user, make_item):
     root = make_item(user, 'ELEC3609', ItemType.GOAL)
     make_item(user, 'second', parent=root, priority_position=2,
-              duration_category=DurationCategory.OVER_60_MIN)
+              duration_category=DurationCategory.UNDER_4_HOURS)
     make_item(user, 'first', parent=root, priority_position=1)
 
     response = client.get('/api/planning/priority/')

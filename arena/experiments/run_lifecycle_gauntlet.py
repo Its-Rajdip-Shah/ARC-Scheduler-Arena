@@ -19,7 +19,7 @@ import django
 django.setup()
 
 from accounts.models import User
-from planning.models import PlanningItem, SchedulingPreference
+from planning.models import PlanningItem
 from planning.services import scheduling
 
 from arena.evaluation.invariants import execution_frontier
@@ -35,19 +35,11 @@ TODAY = date(2026, 9, 20)
 
 def reset():
     PlanningItem.objects.all().delete()
-    SchedulingPreference.objects.all().delete()
     User.objects.filter(email="lifecycle@arena.test").delete()
 
     user = User.objects.create_user(
         email="lifecycle@arena.test",
         password="arena-local-only",
-    )
-
-    SchedulingPreference.objects.create(
-        user=user,
-        under_20=5,
-        minutes_20_to_60=4,
-        over_60=3,
     )
 
     return user
@@ -71,17 +63,17 @@ def item(
         parent=parent,
         due_date=TODAY + timedelta(days=due_days),
         is_completed=completed,
-        schedule_is_manual=manual,
+        manual_requested_date=scheduled if manual else None,
         scheduled_date=scheduled,
     )
 
 
 def reschedule_and_validate(user):
     anchored_before = {
-        x.id: x.scheduled_date
+        x.id: x.manual_requested_date
         for x in PlanningItem.objects.filter(
             user=user,
-            schedule_is_manual=True,
+            manual_requested_date__isnull=False,
             is_deleted=False,
         )
     }
