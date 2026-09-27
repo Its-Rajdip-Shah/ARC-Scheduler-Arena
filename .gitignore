@@ -44,3 +44,6 @@ cluster*_backup_*/
 .env
 .env.*
 !.env.example
+build/
+dist/
+*.egg-info/
