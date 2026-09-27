@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import csv
 import os
 import sys
@@ -20,20 +21,25 @@ import django
 django.setup()
 
 from accounts.models import User
-from planning.models import PlanningItem
+from planning.models import DurationCategory, PlanningItem
 
 
+# Compatibility for the existing legacy corpus only, not canonical ARC semantics.
 DURATION_MAP = {
-    "UNDER_20_MIN": "UNDER_20_MIN",
-    "MIN_20_TO_60": "MIN_20_TO_60",
-    "OVER_60_MIN": "OVER_60_MIN",
-
-    # Experimental buckets collapse into ARC's current largest bucket
-    # when benchmarking algorithms against the native ARC schema.
-    "HOURS_1_TO_4": "OVER_60_MIN",
-    "HOURS_4_TO_12": "OVER_60_MIN",
-    "OVER_12_HOURS": "OVER_60_MIN",
+    "UNDER_20_MIN": DurationCategory.UNDER_20_MINUTES,
+    "MIN_20_TO_60": DurationCategory.UNDER_1_HOUR,
+    "OVER_60_MIN": DurationCategory.UNDER_4_HOURS,
+    "HOURS_1_TO_4": DurationCategory.UNDER_4_HOURS,
+    "HOURS_4_TO_12": DurationCategory.UNDER_16_HOURS,
+    "OVER_12_HOURS": DurationCategory.OVER_16_HOURS,
 }
+
+
+def map_legacy_duration(raw: str) -> DurationCategory:
+    try:
+        return DURATION_MAP[raw]
+    except KeyError:
+        raise ValueError(f"Unknown legacy raw duration class: {raw!r}") from None
 
 
 def _rows(filename: str) -> list[dict[str, str]]:
@@ -45,7 +51,25 @@ def available_scenarios() -> list[str]:
     return [row["scenario"] for row in _rows("scenarios.csv")]
 
 
-def load_scenario(name: str) -> None:
+def legacy_priority_positions(rows: list[dict[str, str]]) -> tuple[dict[str, int], dict]:
+    """Linearize legacy ordinal ties by original CSV row order, then densify.
+
+    Frozen ARC represents a strict total order. This fixture-only compatibility
+    policy preserves representable ordering, not a claim that ties were distinct.
+    Compute before hierarchy materialization, whose insertion order may differ.
+    """
+    prioritized = [(int(row["priority"]), index, row["key"])
+                   for index, row in enumerate(rows) if row["priority"].strip()]
+    counts = Counter(priority for priority, _, _ in prioritized)
+    tie_count = sum(count > 1 for count in counts.values())
+    positions = {key: position for position, (_, _, key) in enumerate(sorted(prioritized), 1)}
+    return positions, {
+        "legacy_priority_linearized": tie_count > 0,
+        "legacy_priority_tie_count": tie_count,
+    }
+
+
+def load_scenario(name: str) -> dict:
     scenario_rows = _rows("scenarios.csv")
     item_rows = _rows("items.csv")
 
@@ -64,6 +88,12 @@ def load_scenario(name: str) -> None:
 
     if not rows:
         raise ValueError(f"Scenario {name!r} contains no items.")
+
+    # Validate legacy classes before replacing the loaded scenario.
+    for row in rows:
+        map_legacy_duration(row["duration_class"])
+
+    positions, compatibility = legacy_priority_positions(rows)
 
     # Arena DB is disposable. Keep exactly one benchmark user/state loaded.
     PlanningItem.objects.all().delete()
@@ -91,7 +121,7 @@ def load_scenario(name: str) -> None:
                 "title": row["title"],
                 "item_type": row["item_type"],
                 "parent": by_key.get(parent_key),
-                "duration_category": DURATION_MAP[row["duration_class"]],
+                "duration_category": map_legacy_duration(row["duration_class"]),
                 "is_completed": row["completed"].lower() == "true",
                 "manual_requested_date": (row["scheduled_date"] or None) if row["anchored"].lower() == "true" else None,
             }
@@ -105,8 +135,8 @@ def load_scenario(name: str) -> None:
             if row["scheduled_date"]:
                 kwargs["scheduled_date"] = row["scheduled_date"]
 
-            if row["priority"]:
-                kwargs["priority_position"] = int(row["priority"])
+            if row["key"] in positions:
+                kwargs["priority_position"] = positions[row["key"]]
 
             item = PlanningItem.objects.create(**kwargs)
             by_key[row["key"]] = item
@@ -130,6 +160,7 @@ def load_scenario(name: str) -> None:
     print(f"Items:  {len(by_key)}")
     print(f"Today:  {scenario['today']}")
     print()
+    return compatibility
 
 
 def print_hierarchy() -> None:

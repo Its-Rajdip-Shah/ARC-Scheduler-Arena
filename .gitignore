@@ -34,3 +34,13 @@ cluster*_backup_*/
 # Editors
 .vscode/
 .idea/
+
+# Historical scheduler scratch backups
+*.pre_*
+*.pre*
+*.orig
+
+# Local secret/config variants
+.env
+.env.*
+!.env.example

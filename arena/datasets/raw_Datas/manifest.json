@@ -11,14 +11,14 @@
   },
   "files": [
     "scenarios.csv",
-    "items.csv",
-    "capacities.csv"
+    "items.csv"
   ],
   "notes": [
     "parent_key is scenario-local and forms the hierarchy.",
     "release_date maps to ARC start_date.",
-    "anchored maps to ARC schedule_is_manual.",
-    "Experimental duration classes are intentionally present for Arena experiments and require mapping when materialising into current ARC's 3-class schema.",
-    "Canonical input fixtures should be reloaded/reset between algorithm runs."
+    "anchored uses the raw scheduled_date as ARC manual_requested_date, never schedule_is_manual.",
+    "Legacy duration classes use the explicit importer compatibility map into frozen ARC six-category DurationCategory; this map is not canonical semantics.",
+    "Canonical input fixtures should be reloaded/reset between algorithm runs.",
+    "capacities.csv is retained as obsolete legacy data only; no active consumer, canonical state, or feature input."
   ]
 }
