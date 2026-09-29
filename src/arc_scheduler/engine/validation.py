@@ -183,6 +183,40 @@ def validate_plan(
                 )
             )
 
+        if (
+            item.anchor_order is not None
+            and first.scheduled_date
+            == item.anchor_date
+        ):
+            day_count = sum(
+                1
+                for allocation
+                in plan.allocations
+                if (
+                    allocation.scheduled_date
+                    == item.anchor_date
+                )
+            )
+
+            # Exact requested slots are hard whenever the day contains
+            # enough rows to represent them. A request beyond the current
+            # row count degrades to the latest feasible slot rather than
+            # inventing dummy work merely to satisfy an ordinal number.
+            if (
+                item.anchor_order
+                <= day_count
+                and first.execution_rank
+                != item.anchor_order
+            ):
+                violations.add(
+                    PlanViolation(
+                        "anchor_order_violation",
+                        item_id=item_id,
+                        scheduled_date=
+                            first.scheduled_date,
+                    )
+                )
+
     # Every algorithm-visible unfinished item must receive exactly its
     # remaining work. This prevents algorithms from silently dropping work or
     # manufacturing extra completion.

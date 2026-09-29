@@ -40,6 +40,7 @@ def _problem_from_input(request: SchedulerInputV1) -> ScheduleProblem:
                 remaining_fraction=task.remaining_fraction,
                 is_residual=task.is_residual,
                 existing_scheduled_date=task.existing_scheduled_date,
+                anchor_order=task.anchor_order,
             )
             for task in request.tasks
         ),

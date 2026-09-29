@@ -495,53 +495,205 @@ def allocation_hours(
     )
 
 
+
+def _order_day_for_execution(
+    rows: tuple[WorkAllocation, ...],
+    problem: ScheduleProblem | None,
+) -> tuple[WorkAllocation, ...]:
+    """Materialize one day's explicit execution-order intent.
+
+    Automatic work keeps the scheduler's existing deterministic item-id
+    order. Explicit anchor_order claims occupy their requested slots and
+    automatic rows fill the remaining gaps.
+
+    If a requested slot is larger than the number of rows that ultimately
+    remain on that day, the anchored row is placed as late as currently
+    feasible. Its canonical request remains unchanged, so a later schedule
+    with more rows can again satisfy the requested slot.
+
+    This function is the only production location that translates
+    anchor_order input intent into disposable execution_rank output.
+    """
+
+    baseline = tuple(
+        sorted(
+            rows,
+            key=lambda row: row.item_id,
+        )
+    )
+
+    if (
+        problem is None
+        or not baseline
+    ):
+        return baseline
+
+    item_by_id = problem.item_by_id
+
+    fixed: list[
+        tuple[int, WorkAllocation]
+    ] = []
+
+    automatic: list[
+        WorkAllocation
+    ] = []
+
+    for row in baseline:
+        item = item_by_id[
+            row.item_id
+        ]
+
+        if (
+            item.anchor_date
+            == row.scheduled_date
+            and item.anchor_order
+            is not None
+        ):
+            fixed.append(
+                (
+                    item.anchor_order,
+                    row,
+                )
+            )
+        else:
+            automatic.append(
+                row
+            )
+
+    if not fixed:
+        return baseline
+
+    claimed = [
+        order
+        for order, _
+        in fixed
+    ]
+
+    if len(claimed) != len(set(claimed)):
+        raise ValueError(
+            "Duplicate anchored execution slot."
+        )
+
+    slots: list[
+        WorkAllocation | None
+    ] = [
+        None
+        for _ in baseline
+    ]
+
+    overflow: list[
+        tuple[int, WorkAllocation]
+    ] = []
+
+    for order, row in sorted(
+        fixed,
+        key=lambda pair: (
+            pair[0],
+            pair[1].item_id,
+        ),
+    ):
+        index = order - 1
+
+        if index < len(slots):
+            if slots[index] is not None:
+                raise ValueError(
+                    "Duplicate anchored execution slot."
+                )
+
+            slots[index] = row
+        else:
+            overflow.append(
+                (
+                    order,
+                    row,
+                )
+            )
+
+    fillers = iter(
+        [
+            *automatic,
+            *[
+                row
+                for _, row
+                in sorted(
+                    overflow,
+                    key=lambda pair: (
+                        pair[0],
+                        pair[1].item_id,
+                    ),
+                )
+            ],
+        ]
+    )
+
+    for index, row in enumerate(
+        slots
+    ):
+        if row is None:
+            slots[index] = next(
+                fillers
+            )
+
+    return tuple(
+        row
+        for row in slots
+        if row is not None
+    )
+
+
 def work_allocations_to_plan(
     allocations: tuple[
         WorkAllocation,
         ...,
     ],
+    *,
+    problem: ScheduleProblem | None = None,
 ) -> SchedulePlan:
-    """Convert dynamic work allocations to disposable ARC plan rows."""
+    """Convert dynamic work allocations to disposable ARC plan rows.
 
-    ranks: dict[
+    With no explicit anchor_order intent this preserves the historical
+    deterministic date/item ordering exactly.
+    """
+
+    by_day: dict[
         date,
-        int,
+        list[WorkAllocation],
     ] = {}
+
+    for allocation in allocations:
+        by_day.setdefault(
+            allocation.scheduled_date,
+            [],
+        ).append(
+            allocation
+        )
 
     rows = []
 
-    for allocation in sorted(
-        allocations,
-        key=lambda row: (
-            row.scheduled_date,
-            row.item_id,
-        ),
-    ):
-        ranks[
-            allocation.scheduled_date
-        ] = (
-            ranks.get(
-                allocation.scheduled_date,
-                0,
-            )
-            + 1
+    for day in sorted(by_day):
+        ordered = _order_day_for_execution(
+            tuple(
+                by_day[day]
+            ),
+            problem,
         )
 
-        rows.append(
-            Allocation(
-                item_id=
-                    allocation.item_id,
-                scheduled_date=
-                    allocation.scheduled_date,
-                percentage=
-                    allocation.percentage,
-                execution_rank=
-                    ranks[
-                        allocation
-                        .scheduled_date
-                    ],
+        for rank, allocation in enumerate(
+            ordered,
+            start=1,
+        ):
+            rows.append(
+                Allocation(
+                    item_id=
+                        allocation.item_id,
+                    scheduled_date=
+                        allocation.scheduled_date,
+                    percentage=
+                        allocation.percentage,
+                    execution_rank=
+                        rank,
+                )
             )
-        )
 
     return SchedulePlan(
         tuple(rows)

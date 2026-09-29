@@ -1113,7 +1113,8 @@ def generate_flavour_schedule(
         work_allocations_to_plan(
             tuple(
                 work_allocations
-            )
+            ),
+            problem=problem,
         )
     )
 

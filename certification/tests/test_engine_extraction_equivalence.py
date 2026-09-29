@@ -34,8 +34,25 @@ def _canonical(value):
 
     if is_dataclass(value) and not isinstance(value, type):
         return tuple(
-            (field.name, _canonical(getattr(value, field.name)))
+            (
+                field.name,
+                _canonical(
+                    getattr(
+                        value,
+                        field.name,
+                    )
+                ),
+            )
             for field in fields(value)
+            if not (
+                field.name
+                == "anchor_order"
+                and getattr(
+                    value,
+                    field.name,
+                )
+                is None
+            )
         )
 
     if isinstance(value, Enum):

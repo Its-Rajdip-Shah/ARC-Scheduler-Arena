@@ -41,6 +41,11 @@ class SchedulerTaskInputV1:
     # Observational scheduler state only. Never canonical authority.
     existing_scheduled_date: date | None = None
 
+    # Optional explicit human intent for the first allocation's
+    # within-day execution position. This is INPUT intent only;
+    # final execution_rank remains disposable scheduler output.
+    anchor_order: int | None = None
+
     def __post_init__(self) -> None:
         percent = _decimal(self.percent_completed)
         remaining = _decimal(self.remaining_fraction)
@@ -50,6 +55,17 @@ class SchedulerTaskInputV1:
 
         if not Decimal("0") <= remaining <= Decimal("1"):
             raise ValueError("remaining_fraction must be in [0, 1].")
+
+        if self.anchor_order is not None:
+            if self.anchor_date is None:
+                raise ValueError(
+                    "anchor_order requires anchor_date."
+                )
+
+            if self.anchor_order < 1:
+                raise ValueError(
+                    "anchor_order must be positive."
+                )
 
         object.__setattr__(self, "percent_completed", percent)
         object.__setattr__(self, "remaining_fraction", remaining)
@@ -91,6 +107,26 @@ class SchedulerInputV1:
             raise ValueError("Scheduler task IDs must be unique.")
 
         item_ids = set(ids)
+
+        occupied_anchor_slots = [
+            (
+                task.anchor_date,
+                task.anchor_order,
+            )
+            for task in self.tasks
+            if (
+                task.anchor_date is not None
+                and task.anchor_order is not None
+            )
+        ]
+
+        if (
+            len(occupied_anchor_slots)
+            != len(set(occupied_anchor_slots))
+        ):
+            raise ValueError(
+                "Duplicate anchored execution slot."
+            )
 
         edge_pairs = {
             (edge.prerequisite_id, edge.dependent_id)

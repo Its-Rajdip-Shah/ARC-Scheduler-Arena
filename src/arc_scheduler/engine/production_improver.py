@@ -824,7 +824,8 @@ def _rebuild(
 
         plan = (
             work_allocations_to_plan(
-                work_allocations
+                work_allocations,
+                problem=problem,
             )
         )
 
