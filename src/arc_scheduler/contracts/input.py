@@ -14,6 +14,8 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Mapping
 
+from arc_scheduler.focus_order import focus_bucket_key
+
 from .enums import SchedulerFlavourV1
 
 
@@ -41,9 +43,11 @@ class SchedulerTaskInputV1:
     # Observational scheduler state only. Never canonical authority.
     existing_scheduled_date: date | None = None
 
-    # Optional explicit human intent for the first allocation's
-    # within-day execution position. This is INPUT intent only;
-    # final execution_rank remains disposable scheduler output.
+    # Optional explicit human intent for the first allocation's relative
+    # position inside its Focus duration bucket on anchor_date.
+    #
+    # This is INPUT intent only. Final global execution_rank remains
+    # disposable scheduler output and may interleave other Focus buckets.
     anchor_order: int | None = None
 
     def __post_init__(self) -> None:
@@ -111,6 +115,11 @@ class SchedulerInputV1:
         occupied_anchor_slots = [
             (
                 task.anchor_date,
+                focus_bucket_key(
+                    task.duration_category,
+                    is_residual=
+                        task.is_residual,
+                ),
                 task.anchor_order,
             )
             for task in self.tasks
@@ -125,7 +134,8 @@ class SchedulerInputV1:
             != len(set(occupied_anchor_slots))
         ):
             raise ValueError(
-                "Duplicate anchored execution slot."
+                "Duplicate anchored execution slot "
+                "within Focus bucket."
             )
 
         edge_pairs = {

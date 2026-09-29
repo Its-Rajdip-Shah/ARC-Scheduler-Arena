@@ -33,6 +33,7 @@ from arc_scheduler.engine.validation import (
     ValidationResult,
     validate_plan,
 )
+from arc_scheduler.focus_order import focus_bucket_key
 
 
 PERCENT_QUANTUM = Decimal("0.01")
@@ -496,37 +497,14 @@ def allocation_hours(
 
 
 
-def _order_day_for_execution(
+def _order_focus_bucket_for_execution(
     rows: tuple[WorkAllocation, ...],
-    problem: ScheduleProblem | None,
+    problem: ScheduleProblem,
 ) -> tuple[WorkAllocation, ...]:
-    """Materialize one day's explicit execution-order intent.
+    """Apply explicit relative order inside one Focus duration bucket."""
 
-    Automatic work keeps the scheduler's existing deterministic item-id
-    order. Explicit anchor_order claims occupy their requested slots and
-    automatic rows fill the remaining gaps.
-
-    If a requested slot is larger than the number of rows that ultimately
-    remain on that day, the anchored row is placed as late as currently
-    feasible. Its canonical request remains unchanged, so a later schedule
-    with more rows can again satisfy the requested slot.
-
-    This function is the only production location that translates
-    anchor_order input intent into disposable execution_rank output.
-    """
-
-    baseline = tuple(
-        sorted(
-            rows,
-            key=lambda row: row.item_id,
-        )
-    )
-
-    if (
-        problem is None
-        or not baseline
-    ):
-        return baseline
+    if not rows:
+        return rows
 
     item_by_id = problem.item_by_id
 
@@ -538,7 +516,7 @@ def _order_day_for_execution(
         WorkAllocation
     ] = []
 
-    for row in baseline:
+    for row in rows:
         item = item_by_id[
             row.item_id
         ]
@@ -561,7 +539,7 @@ def _order_day_for_execution(
             )
 
     if not fixed:
-        return baseline
+        return rows
 
     claimed = [
         order
@@ -569,16 +547,20 @@ def _order_day_for_execution(
         in fixed
     ]
 
-    if len(claimed) != len(set(claimed)):
+    if (
+        len(claimed)
+        != len(set(claimed))
+    ):
         raise ValueError(
-            "Duplicate anchored execution slot."
+            "Duplicate anchored execution slot "
+            "within Focus bucket."
         )
 
     slots: list[
         WorkAllocation | None
     ] = [
         None
-        for _ in baseline
+        for _ in rows
     ]
 
     overflow: list[
@@ -597,7 +579,8 @@ def _order_day_for_execution(
         if index < len(slots):
             if slots[index] is not None:
                 raise ValueError(
-                    "Duplicate anchored execution slot."
+                    "Duplicate anchored execution slot "
+                    "within Focus bucket."
                 )
 
             slots[index] = row
@@ -640,6 +623,105 @@ def _order_day_for_execution(
         if row is not None
     )
 
+
+def _order_day_for_execution(
+    rows: tuple[WorkAllocation, ...],
+    problem: ScheduleProblem | None,
+) -> tuple[WorkAllocation, ...]:
+    """Materialize bucket-local explicit execution-order intent.
+
+    Historical automatic output is deterministic item-id order.
+
+    ``anchor_order`` is relative inside a Focus duration bucket, not a
+    requested global execution_rank. We therefore keep the day's existing
+    cross-bucket positions fixed and only reorder rows among positions already
+    occupied by the same bucket.
+
+    Example baseline:
+        Boss A, Quick X, Side Y, Boss B
+
+    If Boss A is explicitly Boss position #2:
+        Boss B, Quick X, Side Y, Boss A
+
+    Quick/Side interleaving remains scheduler-controlled and global
+    execution_rank is generated contiguously afterward.
+    """
+
+    baseline = tuple(
+        sorted(
+            rows,
+            key=lambda row:
+                row.item_id,
+        )
+    )
+
+    if (
+        problem is None
+        or not baseline
+    ):
+        return baseline
+
+    item_by_id = problem.item_by_id
+
+    positions_by_bucket: dict[
+        str,
+        list[int],
+    ] = {}
+
+    for index, row in enumerate(
+        baseline
+    ):
+        item = item_by_id[
+            row.item_id
+        ]
+
+        bucket = focus_bucket_key(
+            item.duration_category,
+            is_residual=
+                item.is_residual,
+        )
+
+        positions_by_bucket.setdefault(
+            bucket,
+            [],
+        ).append(
+            index
+        )
+
+    ordered_day = list(
+        baseline
+    )
+
+    for positions in (
+        positions_by_bucket.values()
+    ):
+        bucket_rows = tuple(
+            baseline[index]
+            for index in positions
+        )
+
+        ordered_bucket = (
+            _order_focus_bucket_for_execution(
+                bucket_rows,
+                problem,
+            )
+        )
+
+        for (
+            index,
+            row,
+        ) in zip(
+            positions,
+            ordered_bucket,
+            strict=True,
+        ):
+            ordered_day[
+                index
+            ] = row
+
+    return tuple(
+        ordered_day
+    )
 
 def work_allocations_to_plan(
     allocations: tuple[

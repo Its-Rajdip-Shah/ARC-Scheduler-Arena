@@ -12,6 +12,7 @@ from arc_scheduler.engine.domain import (
     SchedulePlan,
     ScheduleProblem,
 )
+from arc_scheduler.focus_order import focus_bucket_key
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -188,24 +189,60 @@ def validate_plan(
             and first.scheduled_date
             == item.anchor_date
         ):
-            day_count = sum(
-                1
-                for allocation
-                in plan.allocations
-                if (
-                    allocation.scheduled_date
-                    == item.anchor_date
-                )
+            bucket = focus_bucket_key(
+                item.duration_category,
+                is_residual=
+                    item.is_residual,
             )
 
-            # Exact requested slots are hard whenever the day contains
-            # enough rows to represent them. A request beyond the current
-            # row count degrades to the latest feasible slot rather than
-            # inventing dummy work merely to satisfy an ordinal number.
+            bucket_rows = sorted(
+                (
+                    allocation
+                    for allocation
+                    in plan.allocations
+                    if (
+                        allocation.scheduled_date
+                        == item.anchor_date
+                        and focus_bucket_key(
+                            item_by_id[
+                                allocation.item_id
+                            ].duration_category,
+                            is_residual=
+                                item_by_id[
+                                    allocation.item_id
+                                ].is_residual,
+                        )
+                        == bucket
+                    )
+                ),
+                key=lambda allocation:
+                    allocation.execution_rank,
+            )
+
+            local_position = next(
+                (
+                    index
+                    for index, allocation
+                    in enumerate(
+                        bucket_rows,
+                        start=1,
+                    )
+                    if (
+                        allocation.item_id
+                        == item_id
+                    )
+                ),
+                None,
+            )
+
+            # Exact requested bucket positions are hard whenever that bucket
+            # contains enough rows to represent the ordinal. A request beyond
+            # the current bucket size degrades to the latest feasible local
+            # position rather than manufacturing dummy work.
             if (
                 item.anchor_order
-                <= day_count
-                and first.execution_rank
+                <= len(bucket_rows)
+                and local_position
                 != item.anchor_order
             ):
                 violations.add(
