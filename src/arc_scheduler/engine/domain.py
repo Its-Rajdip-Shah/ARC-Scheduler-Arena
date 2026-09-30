@@ -9,7 +9,7 @@ priority, progress, dates, or any other canonical workload state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from types import MappingProxyType
@@ -88,6 +88,32 @@ class ScheduleProblem:
     capacity_by_duration: Mapping[str, int]
     overload_dates: frozenset[date] = frozenset()
 
+    _item_by_id_cache: Mapping[int, ScheduleItem] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _item_ids_cache: frozenset[int] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _direct_prerequisites_cache: Mapping[int, frozenset[int]] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _direct_dependents_cache: Mapping[int, frozenset[int]] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _topological_order_cache: tuple[int, ...] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
     def __post_init__(self) -> None:
         ids = tuple(item.item_id for item in self.items)
 
@@ -121,32 +147,99 @@ class ScheduleProblem:
             MappingProxyType(dict(self.capacity_by_duration)),
         )
 
-        self._assert_acyclic()
+        item_by_id = {
+            item.item_id: item
+            for item in self.items
+        }
+
+        direct_prerequisites = {
+            item_id: set()
+            for item_id in item_ids
+        }
+
+        direct_dependents = {
+            item_id: set()
+            for item_id in item_ids
+        }
+
+        for edge in self.dependencies:
+            direct_prerequisites[
+                edge.dependent_id
+            ].add(
+                edge.prerequisite_id
+            )
+
+            direct_dependents[
+                edge.prerequisite_id
+            ].add(
+                edge.dependent_id
+            )
+
+        object.__setattr__(
+            self,
+            "_item_by_id_cache",
+            MappingProxyType(
+                item_by_id
+            ),
+        )
+
+        object.__setattr__(
+            self,
+            "_item_ids_cache",
+            frozenset(
+                item_ids
+            ),
+        )
+
+        object.__setattr__(
+            self,
+            "_direct_prerequisites_cache",
+            MappingProxyType({
+                item_id:
+                    frozenset(values)
+                for item_id, values
+                in direct_prerequisites.items()
+            }),
+        )
+
+        object.__setattr__(
+            self,
+            "_direct_dependents_cache",
+            MappingProxyType({
+                item_id:
+                    frozenset(values)
+                for item_id, values
+                in direct_dependents.items()
+            }),
+        )
+
+        object.__setattr__(
+            self,
+            "_topological_order_cache",
+            self._compute_topological_order(),
+        )
 
     @property
     def item_by_id(self) -> Mapping[int, ScheduleItem]:
-        return MappingProxyType({
-            item.item_id: item
-            for item in self.items
-        })
+        return self._item_by_id_cache
 
     def direct_prerequisites(self, item_id: int) -> frozenset[int]:
-        self._require_item(item_id)
-
-        return frozenset(
-            edge.prerequisite_id
-            for edge in self.dependencies
-            if edge.dependent_id == item_id
+        self._require_item(
+            item_id
         )
+
+        return self._direct_prerequisites_cache[
+            item_id
+        ]
 
     def direct_dependents(self, item_id: int) -> frozenset[int]:
-        self._require_item(item_id)
-
-        return frozenset(
-            edge.dependent_id
-            for edge in self.dependencies
-            if edge.prerequisite_id == item_id
+        self._require_item(
+            item_id
         )
+
+        return self._direct_dependents_cache[
+            item_id
+        ]
 
     def transitive_prerequisites(self, item_id: int) -> frozenset[int]:
         """All upstream prerequisites implied by graph reachability."""
@@ -189,24 +282,34 @@ class ScheduleProblem:
     def topological_order(self) -> tuple[int, ...]:
         """Deterministic topological ordering of the explicit DAG."""
 
+        return self._topological_order_cache
+
+    def _compute_topological_order(self) -> tuple[int, ...]:
         indegree = {
             item.item_id: 0
             for item in self.items
         }
+
         outgoing = {
             item.item_id: []
             for item in self.items
         }
 
         for edge in self.dependencies:
-            indegree[edge.dependent_id] += 1
-            outgoing[edge.prerequisite_id].append(
+            indegree[
+                edge.dependent_id
+            ] += 1
+
+            outgoing[
+                edge.prerequisite_id
+            ].append(
                 edge.dependent_id
             )
 
         ready = sorted(
             item_id
-            for item_id, degree in indegree.items()
+            for item_id, degree
+            in indegree.items()
             if degree == 0
         )
 
@@ -214,29 +317,45 @@ class ScheduleProblem:
 
         while ready:
             current = ready.pop(0)
-            order.append(current)
 
-            for dependent in sorted(outgoing[current]):
-                indegree[dependent] -= 1
+            order.append(
+                current
+            )
 
-                if indegree[dependent] == 0:
-                    ready.append(dependent)
+            for dependent in sorted(
+                outgoing[current]
+            ):
+                indegree[
+                    dependent
+                ] -= 1
+
+                if (
+                    indegree[
+                        dependent
+                    ]
+                    == 0
+                ):
+                    ready.append(
+                        dependent
+                    )
+
                     ready.sort()
 
         if len(order) != len(self.items):
-            raise ValueError("Dependency graph contains a cycle.")
+            raise ValueError(
+                "Dependency graph contains a cycle."
+            )
 
         return tuple(order)
 
     def _assert_acyclic(self) -> None:
-        self.topological_order()
+        self._compute_topological_order()
 
     def _require_item(self, item_id: int) -> None:
-        if item_id not in {
-            item.item_id
-            for item in self.items
-        }:
-            raise KeyError(item_id)
+        if item_id not in self._item_ids_cache:
+            raise KeyError(
+                item_id
+            )
 
 
 @dataclass(frozen=True, slots=True)
