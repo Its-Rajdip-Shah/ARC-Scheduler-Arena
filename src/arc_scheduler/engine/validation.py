@@ -641,3 +641,310 @@ def is_plan_hard_valid(
             return False
 
     return True
+
+
+def is_plan_hard_valid_incremental(
+    problem: ScheduleProblem,
+    original_plan: SchedulePlan,
+    plan: SchedulePlan,
+    *,
+    changed_item_ids: frozenset[int],
+    changed_dates: frozenset[date],
+) -> bool:
+    """Validate only hard constraints a local production move can change."""
+
+    if not changed_item_ids:
+        return is_plan_hard_valid(
+            problem,
+            plan,
+        )
+
+    item_by_id = problem.item_by_id
+
+    tracked_item_ids = set(
+        changed_item_ids
+    )
+
+    for item_id in changed_item_ids:
+        tracked_item_ids.update(
+            problem.direct_prerequisites(
+                item_id
+            )
+        )
+        tracked_item_ids.update(
+            problem.direct_dependents(
+                item_id
+            )
+        )
+
+    changed_rows = {
+        item_id: []
+        for item_id in changed_item_ids
+    }
+
+    percentage_by_changed_item = {
+        item_id: Decimal("0")
+        for item_id in changed_item_ids
+    }
+
+    first_by_changed_item = {}
+
+    start_date_by_tracked_item = {}
+    completion_date_by_tracked_item = {}
+
+    rows_by_changed_date_and_bucket = {}
+
+    rank_keys_on_changed_dates = set()
+
+    for allocation in plan.allocations:
+        item = item_by_id.get(
+            allocation.item_id
+        )
+
+        if item is None:
+            return False
+
+        item_id = allocation.item_id
+        day = allocation.scheduled_date
+
+        if day in changed_dates:
+            rank_key = (
+                day,
+                allocation.execution_rank,
+            )
+
+            if (
+                rank_key
+                in rank_keys_on_changed_dates
+            ):
+                return False
+
+            rank_keys_on_changed_dates.add(
+                rank_key
+            )
+
+            focus_bucket = focus_bucket_key(
+                item.duration_category,
+                is_residual=item.is_residual,
+            )
+
+            rows_by_changed_date_and_bucket.setdefault(
+                (
+                    day,
+                    focus_bucket,
+                ),
+                [],
+            ).append(
+                allocation
+            )
+
+        if item_id in tracked_item_ids:
+            previous_start = (
+                start_date_by_tracked_item.get(
+                    item_id
+                )
+            )
+
+            if (
+                previous_start is None
+                or day < previous_start
+            ):
+                start_date_by_tracked_item[
+                    item_id
+                ] = day
+
+            previous_completion = (
+                completion_date_by_tracked_item.get(
+                    item_id
+                )
+            )
+
+            if (
+                previous_completion is None
+                or day > previous_completion
+            ):
+                completion_date_by_tracked_item[
+                    item_id
+                ] = day
+
+        if item_id not in changed_item_ids:
+            continue
+
+        if day < problem.today:
+            return False
+
+        if (
+            item.release_date is not None
+            and day < item.release_date
+        ):
+            return False
+
+        changed_rows[
+            item_id
+        ].append(
+            allocation
+        )
+
+        percentage_by_changed_item[
+            item_id
+        ] += allocation.percentage
+
+        previous_first = (
+            first_by_changed_item.get(
+                item_id
+            )
+        )
+
+        if (
+            previous_first is None
+            or (
+                day,
+                allocation.execution_rank,
+            )
+            < (
+                previous_first.scheduled_date,
+                previous_first.execution_rank,
+            )
+        ):
+            first_by_changed_item[
+                item_id
+            ] = allocation
+
+    for item_id in changed_item_ids:
+        item = item_by_id[
+            item_id
+        ]
+
+        rows = changed_rows[
+            item_id
+        ]
+
+        if (
+            percentage_by_changed_item[
+                item_id
+            ]
+            != item.remaining_fraction
+            * Decimal("100")
+        ):
+            return False
+
+        if rows:
+            bucket = (
+                "UNDER_20_MINUTES"
+                if item.is_residual
+                else item.duration_category
+            )
+
+            if (
+                bucket
+                in {
+                    "UNDER_20_MINUTES",
+                    "UNDER_1_HOUR",
+                    "UNDER_4_HOURS",
+                }
+                and len(rows) != 1
+            ):
+                return False
+
+        if (
+            item.anchor_date is not None
+            and rows
+            and first_by_changed_item[
+                item_id
+            ].scheduled_date
+            != item.anchor_date
+        ):
+            return False
+
+    for item in problem.items:
+        if (
+            item.anchor_date is None
+            or item.anchor_order is None
+            or item.anchor_date
+            not in changed_dates
+        ):
+            continue
+
+        focus_bucket = focus_bucket_key(
+            item.duration_category,
+            is_residual=item.is_residual,
+        )
+
+        ordered_bucket = sorted(
+            rows_by_changed_date_and_bucket.get(
+                (
+                    item.anchor_date,
+                    focus_bucket,
+                ),
+                (),
+            ),
+            key=lambda row:
+                row.execution_rank,
+        )
+
+        local_position = next(
+            (
+                index
+                for index, row
+                in enumerate(
+                    ordered_bucket,
+                    start=1,
+                )
+                if row.item_id
+                == item.item_id
+            ),
+            None,
+        )
+
+        if (
+            item.anchor_order
+            <= len(ordered_bucket)
+            and local_position
+            != item.anchor_order
+        ):
+            return False
+
+    for edge in problem.dependencies:
+        if (
+            edge.prerequisite_id
+            not in changed_item_ids
+            and edge.dependent_id
+            not in changed_item_ids
+        ):
+            continue
+
+        prerequisite_completion = (
+            completion_date_by_tracked_item.get(
+                edge.prerequisite_id
+            )
+        )
+
+        dependent_start = (
+            start_date_by_tracked_item.get(
+                edge.dependent_id
+            )
+        )
+
+        if (
+            prerequisite_completion is None
+            or dependent_start is None
+            or dependent_start
+            > prerequisite_completion
+        ):
+            continue
+
+        prerequisite = item_by_id[
+            edge.prerequisite_id
+        ]
+
+        dependent = item_by_id[
+            edge.dependent_id
+        ]
+
+        if (
+            prerequisite.anchor_date is None
+            and dependent.anchor_date is None
+        ):
+            return False
+
+    return True

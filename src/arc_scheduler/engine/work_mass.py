@@ -32,6 +32,7 @@ from arc_scheduler.engine.mechanics import (
 from arc_scheduler.engine.validation import (
     ValidationResult,
     is_plan_hard_valid,
+    is_plan_hard_valid_incremental,
     validate_plan,
 )
 from arc_scheduler.focus_order import focus_bucket_key
@@ -838,4 +839,22 @@ def is_dynamic_plan_hard_valid(
     return is_plan_hard_valid(
         problem,
         plan,
+    )
+
+
+
+def is_dynamic_plan_hard_valid_incremental(
+    problem: ScheduleProblem,
+    original_plan: SchedulePlan,
+    plan: SchedulePlan,
+    *,
+    changed_item_ids: frozenset[int],
+    changed_dates: frozenset[date],
+) -> bool:
+    return is_plan_hard_valid_incremental(
+        problem,
+        original_plan,
+        plan,
+        changed_item_ids=changed_item_ids,
+        changed_dates=changed_dates,
     )

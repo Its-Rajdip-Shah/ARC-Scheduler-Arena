@@ -44,6 +44,7 @@ from arc_scheduler.engine.work_mass import (
     WorkAllocation,
     allocate_work_mass,
     is_dynamic_plan_hard_valid,
+    is_dynamic_plan_hard_valid_incremental,
     validate_dynamic_plan,
     work_allocations_to_plan,
 )
@@ -940,12 +941,28 @@ def _rebuild(
             )
         )
 
-        hard_valid = (
-            is_dynamic_plan_hard_valid(
-                problem,
-                plan,
+        if (
+            changed_item_ids is not None
+            and changed_dates is not None
+        ):
+            hard_valid = (
+                is_dynamic_plan_hard_valid_incremental(
+                    problem,
+                    original.plan,
+                    plan,
+                    changed_item_ids=
+                        changed_item_ids,
+                    changed_dates=
+                        changed_dates,
+                )
             )
-        )
+        else:
+            hard_valid = (
+                is_dynamic_plan_hard_valid(
+                    problem,
+                    plan,
+                )
+            )
 
         if _VERIFY_FAST_VALIDATION:
             full_hard_valid = not (
