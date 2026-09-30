@@ -983,22 +983,9 @@ def _rebuild(
             days=1
         )
 
-    policy = _policy(
-        original.flavour
-    )
-
-    daily_status = {
-        day: classify_day(
-            hours,
-            preferred_daily_hours=
-                policy.preferred_daily_hours,
-            soft_max_daily_hours=
-                policy.soft_max_daily_hours,
-        )
-        for day, hours
-        in daily_hours.items()
-    }
-
+    # Search candidates do not consume these derived display/status
+    # projections. Reuse the previous projections while hill climbing and
+    # rebuild them once for the final returned schedule.
     return PlannedSchedule(
         flavour=original.flavour,
         plan=plan,
@@ -1006,22 +993,9 @@ def _rebuild(
             work_allocations,
         estimates=original.estimates,
         daily_hours=daily_hours,
-        daily_status=daily_status,
-        weekly_status=weekly_statuses(
-            daily_hours,
-            preferred_daily_hours=
-                policy.preferred_daily_hours,
-            soft_max_daily_hours=
-                policy.soft_max_daily_hours,
-        ),
-        monthly_status=
-            monthly_statuses(
-                daily_hours,
-                preferred_daily_hours=
-                    policy.preferred_daily_hours,
-                soft_max_daily_hours=
-                    policy.soft_max_daily_hours,
-            ),
+        daily_status=original.daily_status,
+        weekly_status=original.weekly_status,
+        monthly_status=original.monthly_status,
     )
 
 
@@ -3428,6 +3402,51 @@ def _repair_window_candidates(
     return tuple(results)
 
 
+def _refresh_schedule_statuses(
+    schedule: PlannedSchedule,
+) -> PlannedSchedule:
+    policy = _policy(
+        schedule.flavour
+    )
+
+    daily_status = {
+        day: classify_day(
+            hours,
+            preferred_daily_hours=
+                policy.preferred_daily_hours,
+            soft_max_daily_hours=
+                policy.soft_max_daily_hours,
+        )
+        for day, hours
+        in schedule.daily_hours.items()
+    }
+
+    return PlannedSchedule(
+        flavour=schedule.flavour,
+        plan=schedule.plan,
+        work_allocations=
+            schedule.work_allocations,
+        estimates=schedule.estimates,
+        daily_hours=schedule.daily_hours,
+        daily_status=daily_status,
+        weekly_status=weekly_statuses(
+            schedule.daily_hours,
+            preferred_daily_hours=
+                policy.preferred_daily_hours,
+            soft_max_daily_hours=
+                policy.soft_max_daily_hours,
+        ),
+        monthly_status=monthly_statuses(
+            schedule.daily_hours,
+            preferred_daily_hours=
+                policy.preferred_daily_hours,
+            soft_max_daily_hours=
+                policy.soft_max_daily_hours,
+        ),
+    )
+
+
+
 def improve_production_schedule(
     problem: ScheduleProblem,
     initial: PlannedSchedule,
@@ -4055,9 +4074,15 @@ def improve_production_schedule(
             current_objective.key
         )
 
+    final_schedule = (
+        _refresh_schedule_statuses(
+            current
+        )
+    )
+
     return ProductionImproveResult(
         initial_schedule=initial,
-        final_schedule=current,
+        final_schedule=final_schedule,
         initial_objective=
             initial_objective,
         final_objective=
