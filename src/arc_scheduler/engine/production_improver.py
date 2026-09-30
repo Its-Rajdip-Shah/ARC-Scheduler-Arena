@@ -772,6 +772,9 @@ def _rebuild(
     original: PlannedSchedule,
     hours_by_item:
         dict[int, dict[date, Decimal]],
+    *,
+    changed_item_ids:
+        frozenset[int] | None = None,
 ) -> PlannedSchedule | None:
     work_rows: list[
         WorkAllocation
@@ -779,10 +782,38 @@ def _rebuild(
 
     item_by_id = problem.item_by_id
 
+    reusable_rows: dict[
+        int,
+        list[WorkAllocation],
+    ] = defaultdict(list)
+
+    if changed_item_ids is not None:
+        for row in original.work_allocations:
+            if row.item_id not in changed_item_ids:
+                reusable_rows[
+                    row.item_id
+                ].append(row)
+
     try:
         for item_id in sorted(
             hours_by_item
         ):
+            if (
+                changed_item_ids is not None
+                and item_id not in changed_item_ids
+            ):
+                rows = reusable_rows.get(
+                    item_id
+                )
+
+                if not rows:
+                    return None
+
+                work_rows.extend(
+                    rows
+                )
+                continue
+
             positive = tuple(
                 DayHeadroom(
                     scheduled_date=day,
@@ -1698,6 +1729,10 @@ def _apply_move(
         problem,
         schedule,
         hours_by_item,
+        changed_item_ids=
+            frozenset((
+                move.item_id,
+            )),
     )
 
 
@@ -1775,6 +1810,11 @@ def _apply_compound_move(
         problem,
         schedule,
         hours_by_item,
+        changed_item_ids=
+            frozenset((
+                move.first.item_id,
+                move.second.item_id,
+            )),
     )
 
 
