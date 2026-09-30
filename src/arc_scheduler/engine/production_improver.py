@@ -398,10 +398,16 @@ def score_production_schedule(
         list[WorkAllocation],
     ] = defaultdict(list)
 
+    allocated_by_day: set[date] = set()
+
     for row in schedule.work_allocations:
         by_item[
             row.item_id
         ].append(row)
+
+        allocated_by_day.add(
+            row.scheduled_date
+        )
 
         item = item_by_id[
             row.item_id
@@ -464,6 +470,8 @@ def score_production_schedule(
     priority_postponement_days = D("0")
     continuity_gap_days = 0
 
+    completion_by_item: dict[int, date] = {}
+
     for item_id, rows in by_item.items():
         item = item_by_id[item_id]
 
@@ -471,6 +479,11 @@ def score_production_schedule(
             rows,
             key=lambda row:
                 row.scheduled_date,
+        )
+
+        by_item[item_id] = rows
+        completion_by_item[item_id] = (
+            rows[-1].scheduled_date
         )
 
         bucket = context.bucket_by_item[
@@ -550,10 +563,10 @@ def score_production_schedule(
                     )
 
                     if prerequisite_rows:
-                        prerequisite_completion = max(
-                            row.scheduled_date
-                            for row
-                            in prerequisite_rows
+                        prerequisite_completion = (
+                            completion_by_item[
+                                prerequisite_id
+                            ]
                         )
 
                         earliest = max(
@@ -608,10 +621,9 @@ def score_production_schedule(
             item_id
         )
 
-        completion = max(
-            row.scheduled_date
-            for row in rows
-        )
+        completion = completion_by_item[
+            item_id
+        ]
 
         # A long focused block is considered justified when the task has at
         # least two full days of effective deadline buffer. This preserves the
@@ -702,14 +714,8 @@ def score_production_schedule(
     if schedule.flavour == "lock-in":
         if schedule.work_allocations:
             final_active = max(
-                row.scheduled_date
-                for row in schedule.work_allocations
+                completion_by_item.values()
             )
-
-            allocated_by_day = {
-                row.scheduled_date
-                for row in schedule.work_allocations
-            }
 
             cursor = problem.today
 
@@ -736,21 +742,18 @@ def score_production_schedule(
                         ):
                             continue
 
-                        if any(
-                            row.scheduled_date > cursor
-                            for row in rows
+                        if (
+                            completion_by_item[
+                                item.item_id
+                            ]
+                            > cursor
                         ):
                             avoidable_idle_days += 1
                             break
 
                 cursor += timedelta(days=1)
 
-    for rows in by_item.values():
-        completion = max(
-            row.scheduled_date
-            for row in rows
-        )
-
+    for completion in completion_by_item.values():
         completion_day_sum += (
             completion
             - problem.today
