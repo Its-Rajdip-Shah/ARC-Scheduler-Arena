@@ -29,6 +29,7 @@ from decimal import Decimal
 
 from arc_scheduler.engine.flavour_planner import (
     ATOMIC_BUCKETS,
+    FlavourPolicy,
     PlannedSchedule,
     _policy,
 )
@@ -51,6 +52,16 @@ from arc_scheduler.engine.mechanics import effective_bucket
 
 
 D = Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class _ProductionScoringContext:
+    policy: FlavourPolicy
+    effective_due_dates: dict[int, date | None]
+    priority_weight_by_item: dict[int, Decimal]
+    bucket_by_item: dict[int, str]
+    earliest_legal_date_by_item: dict[int, date]
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,13 +324,70 @@ def _priority_weight(
     return D("1") / D(priority_position)
 
 
-def score_production_schedule(
+def _build_production_scoring_context(
     problem: ScheduleProblem,
     schedule: PlannedSchedule,
-) -> ProductionObjective:
+) -> _ProductionScoringContext:
     policy = _policy(
         schedule.flavour
     )
+
+    represented_remaining: dict[int, Decimal] = {
+        item.item_id: D("0")
+        for item in problem.items
+    }
+
+    for row in schedule.work_allocations:
+        represented_remaining[
+            row.item_id
+        ] += row.hours
+
+    from arc_scheduler.engine.flavour_planner import (
+        _effective_due_dates,
+    )
+
+    return _ProductionScoringContext(
+        policy=policy,
+        effective_due_dates=_effective_due_dates(
+            problem=problem,
+            remaining=represented_remaining,
+            policy=policy,
+        ),
+        priority_weight_by_item={
+            item.item_id: _priority_weight(
+                item.priority_position
+            )
+            for item in problem.items
+        },
+        bucket_by_item={
+            item.item_id:
+                effective_bucket(item)
+            for item in problem.items
+        },
+        earliest_legal_date_by_item={
+            item.item_id: max(
+                problem.today,
+                item.release_date
+                or problem.today,
+            )
+            for item in problem.items
+        },
+    )
+
+
+def score_production_schedule(
+    problem: ScheduleProblem,
+    schedule: PlannedSchedule,
+    *,
+    context: _ProductionScoringContext | None = None,
+) -> ProductionObjective:
+    if context is None:
+        context = _build_production_scoring_context(
+            problem,
+            schedule,
+        )
+
+    policy = context.policy
 
     item_by_id = problem.item_by_id
 
@@ -405,7 +473,9 @@ def score_production_schedule(
                 row.scheduled_date,
         )
 
-        bucket = effective_bucket(item)
+        bucket = context.bucket_by_item[
+            item_id
+        ]
 
         if bucket not in ATOMIC_BUCKETS:
             # A splittable task pays for repeated context restarts. One
@@ -453,9 +523,9 @@ def score_production_schedule(
         # Priority postponement is measured only after a task could actually
         # begin. Dependency completion in THIS candidate schedule therefore
         # shifts the earliest feasible start forward correctly.
-        weight = _priority_weight(
-            item.priority_position
-        )
+        weight = context.priority_weight_by_item[
+            item_id
+        ]
 
         if weight > 0 and rows:
             earliest = max(
@@ -508,34 +578,8 @@ def score_production_schedule(
 
     completion_day_sum = 0
 
-    # Planner-only propagated deadlines are reused for human deadline-risk
-    # scoring. Canonical task due dates remain untouched.
-    from arc_scheduler.engine.flavour_planner import (
-        _effective_due_dates,
-    )
-
-    # Effective dependency deadlines must be derived using the actual amount
-    # of remaining work represented by this production schedule. Passing zero
-    # here would incorrectly imply that downstream tasks require zero work
-    # sessions and would weaken inherited prerequisite urgency.
-    represented_remaining = {
-        item.item_id: sum(
-            (
-                row.hours
-                for row in by_item.get(
-                    item.item_id,
-                    ()
-                )
-            ),
-            D("0"),
-        )
-        for item in problem.items
-    }
-
-    effective_due_dates = _effective_due_dates(
-        problem=problem,
-        remaining=represented_remaining,
-        policy=policy,
+    effective_due_dates = (
+        context.effective_due_dates
     )
 
     deadline_buffer_risk = D("0")
@@ -556,7 +600,9 @@ def score_production_schedule(
             continue
 
         item = item_by_id[item_id]
-        bucket = effective_bucket(item)
+        bucket = context.bucket_by_item[
+            item_id
+        ]
 
         effective_due = effective_due_dates.get(
             item_id
@@ -595,10 +641,10 @@ def score_production_schedule(
         # Its overload is genuinely infeasible, but its same-day concentration
         # is not a human-shape choice and therefore must not pollute this
         # metric.
-        earliest_legal_date = max(
-            problem.today,
-            item.release_date
-            or problem.today,
+        earliest_legal_date = (
+            context.earliest_legal_date_by_item[
+                item_id
+            ]
         )
 
         has_alternative_legal_date = (
@@ -3405,10 +3451,18 @@ def improve_production_schedule(
 
     current = initial
 
+    scoring_context = (
+        _build_production_scoring_context(
+            problem,
+            initial,
+        )
+    )
+
     initial_objective = (
         score_production_schedule(
             problem,
             current,
+            context=scoring_context,
         )
     )
 
@@ -3488,6 +3542,7 @@ def improve_production_schedule(
                     score_production_schedule(
                         problem,
                         candidate,
+                        context=scoring_context,
                     )
                 )
 
@@ -3569,6 +3624,7 @@ def improve_production_schedule(
                 score_production_schedule(
                     problem,
                     candidate,
+                    context=scoring_context,
                 )
             )
 
@@ -3628,6 +3684,7 @@ def improve_production_schedule(
                 score_production_schedule(
                     problem,
                     candidate,
+                    context=scoring_context,
                 )
             )
 
@@ -3693,6 +3750,7 @@ def improve_production_schedule(
                 score_production_schedule(
                     problem,
                     candidate,
+                    context=scoring_context,
                 )
             )
 
@@ -3762,6 +3820,7 @@ def improve_production_schedule(
                 score_production_schedule(
                     problem,
                     candidate,
+                    context=scoring_context,
                 )
             )
 
@@ -3808,6 +3867,7 @@ def improve_production_schedule(
                     score_production_schedule(
                         problem,
                         candidate,
+                        context=scoring_context,
                     )
                 )
 
@@ -3871,6 +3931,7 @@ def improve_production_schedule(
                 score_production_schedule(
                     problem,
                     candidate,
+                    context=scoring_context,
                 )
             )
 
@@ -3920,6 +3981,7 @@ def improve_production_schedule(
                     score_production_schedule(
                         problem,
                         candidate,
+                        context=scoring_context,
                     )
                 )
 
@@ -3958,6 +4020,7 @@ def improve_production_schedule(
                 objective = score_production_schedule(
                     problem,
                     candidate,
+                    context=scoring_context,
                 )
 
                 evaluations += 1
