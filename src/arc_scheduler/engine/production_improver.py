@@ -63,6 +63,13 @@ _VERIFY_FAST_VALIDATION = (
     == "1"
 )
 
+_VERIFY_INCREMENTAL_SCORING = (
+    os.environ.get(
+        "ARC_VERIFY_INCREMENTAL_SCORING"
+    )
+    == "1"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _ProductionScoringContext:
@@ -801,6 +808,736 @@ def score_production_schedule(
             completion_day_sum,
         unjustified_marathon_excess_hours=
             unjustified_marathon_excess_hours,
+    )
+
+
+
+@dataclass(frozen=True, slots=True)
+class _ItemScoreContribution:
+    late_hours: Decimal = D("0")
+    tiny_nonfinal_sessions: int = 0
+    session_shape_penalty: Decimal = D("0")
+    fragmentation_count: int = 0
+    priority_postponement_days: Decimal = D("0")
+    continuity_gap_days: int = 0
+    deadline_buffer_risk: Decimal = D("0")
+    completion_day_sum: int = 0
+    unjustified_marathon_excess_hours: Decimal = D("0")
+
+
+@dataclass(frozen=True, slots=True)
+class _DayScoreContribution:
+    infeasible_day_count: int = 0
+    infeasible_excess_hours: Decimal = D("0")
+    overloaded_day_count: int = 0
+    overloaded_excess_hours: Decimal = D("0")
+    preferred_excess_squared: Decimal = D("0")
+
+
+def _rows_for_items(
+    schedule: PlannedSchedule,
+    item_ids: set[int],
+) -> dict[int, tuple[WorkAllocation, ...]]:
+    rows: dict[int, list[WorkAllocation]] = defaultdict(list)
+
+    for row in schedule.work_allocations:
+        if row.item_id in item_ids:
+            rows[row.item_id].append(row)
+
+    return {
+        item_id: tuple(sorted(
+            item_rows,
+            key=lambda row: row.scheduled_date,
+        ))
+        for item_id, item_rows in rows.items()
+    }
+
+
+def _item_score_contribution(
+    problem: ScheduleProblem,
+    schedule: PlannedSchedule,
+    *,
+    item_id: int,
+    rows_by_item: dict[int, tuple[WorkAllocation, ...]],
+    context: _ProductionScoringContext,
+) -> _ItemScoreContribution:
+    rows = rows_by_item.get(item_id, ())
+
+    if not rows:
+        return _ItemScoreContribution()
+
+    item = problem.item_by_id[item_id]
+    policy = context.policy
+    bucket = context.bucket_by_item[item_id]
+
+    late_hours = sum(
+        (
+            row.hours
+            for row in rows
+            if (
+                item.due_date is not None
+                and row.scheduled_date > item.due_date
+            )
+        ),
+        D("0"),
+    )
+
+    tiny_nonfinal_sessions = 0
+    session_shape_penalty = D("0")
+    fragmentation_count = 0
+
+    if bucket not in ATOMIC_BUCKETS:
+        fragmentation_count = max(
+            0,
+            len(rows) - 1,
+        )
+
+        for index, row in enumerate(rows):
+            is_final = index == len(rows) - 1
+
+            if not (
+                is_final
+                and row.hours
+                < policy.minimum_useful_session_hours
+            ):
+                session_shape_penalty += (
+                    _session_shape_penalty(
+                        row.hours
+                    )
+                )
+
+            if (
+                not is_final
+                and row.hours
+                < policy.minimum_useful_session_hours
+            ):
+                tiny_nonfinal_sessions += 1
+
+    continuity_gap_days = 0
+
+    for left, right in zip(
+        rows,
+        rows[1:],
+    ):
+        gap = (
+            right.scheduled_date
+            - left.scheduled_date
+        ).days - 1
+
+        if gap > 0:
+            continuity_gap_days += gap
+
+    completion = rows[-1].scheduled_date
+
+    weight = context.priority_weight_by_item[
+        item_id
+    ]
+
+    priority_postponement_days = D("0")
+
+    if weight > 0:
+        earliest = max(
+            problem.today,
+            item.release_date
+            or problem.today,
+        )
+
+        if item.anchor_date is not None:
+            earliest = item.anchor_date
+        else:
+            for prerequisite_id in (
+                problem.direct_prerequisites(
+                    item_id
+                )
+            ):
+                prerequisite_rows = (
+                    rows_by_item.get(
+                        prerequisite_id,
+                        (),
+                    )
+                )
+
+                if prerequisite_rows:
+                    prerequisite_completion = (
+                        prerequisite_rows[-1].scheduled_date
+                    )
+
+                    earliest = max(
+                        earliest,
+                        prerequisite_completion
+                        + timedelta(days=1),
+                    )
+
+        delay = max(
+            0,
+            (
+                rows[0].scheduled_date
+                - earliest
+            ).days,
+        )
+
+        priority_postponement_days = (
+            D(delay) * weight
+        )
+
+    effective_due = (
+        context.effective_due_dates.get(
+            item_id
+        )
+    )
+
+    deadline_buffer_risk = D("0")
+    unjustified_marathon_excess_hours = D("0")
+
+    severe_marathon_threshold = (
+        policy.maximum_focused_session_hours
+        + D("1")
+    )
+
+    if effective_due is not None:
+        buffer_days = (
+            effective_due
+            - completion
+        ).days
+        meaningful_buffer = (
+            buffer_days >= 2
+        )
+    else:
+        buffer_days = None
+        meaningful_buffer = False
+
+    earliest_legal_date = (
+        context.earliest_legal_date_by_item[
+            item_id
+        ]
+    )
+
+    has_alternative_legal_date = (
+        effective_due is None
+        or effective_due > earliest_legal_date
+    )
+
+    if (
+        bucket not in ATOMIC_BUCKETS
+        and not meaningful_buffer
+        and has_alternative_legal_date
+    ):
+        for row in rows:
+            unjustified_marathon_excess_hours += max(
+                D("0"),
+                row.hours
+                - severe_marathon_threshold,
+            )
+
+    if effective_due is not None:
+        shortfall = max(
+            0,
+            3 - buffer_days,
+        )
+
+        deadline_buffer_risk = D(
+            shortfall * shortfall
+        )
+
+    return _ItemScoreContribution(
+        late_hours=late_hours,
+        tiny_nonfinal_sessions=
+            tiny_nonfinal_sessions,
+        session_shape_penalty=
+            session_shape_penalty,
+        fragmentation_count=
+            fragmentation_count,
+        priority_postponement_days=
+            priority_postponement_days,
+        continuity_gap_days=
+            continuity_gap_days,
+        deadline_buffer_risk=
+            deadline_buffer_risk,
+        completion_day_sum=(
+            completion
+            - problem.today
+        ).days,
+        unjustified_marathon_excess_hours=
+            unjustified_marathon_excess_hours,
+    )
+
+
+def _day_score_contribution(
+    hours: Decimal,
+    *,
+    policy: FlavourPolicy,
+) -> _DayScoreContribution:
+    infeasible_day_count = int(
+        hours > D("24")
+    )
+    infeasible_excess_hours = max(
+        D("0"),
+        hours - D("24"),
+    )
+
+    overloaded_day_count = int(
+        hours > policy.soft_max_daily_hours
+    )
+    overloaded_excess_hours = max(
+        D("0"),
+        hours - policy.soft_max_daily_hours,
+    )
+
+    preferred_excess = max(
+        D("0"),
+        hours - policy.preferred_daily_hours,
+    )
+
+    return _DayScoreContribution(
+        infeasible_day_count=
+            infeasible_day_count,
+        infeasible_excess_hours=
+            infeasible_excess_hours,
+        overloaded_day_count=
+            overloaded_day_count,
+        overloaded_excess_hours=
+            overloaded_excess_hours,
+        preferred_excess_squared=(
+            preferred_excess
+            * preferred_excess
+        ),
+    )
+
+
+def _priority_postponement_days_exact(
+    problem: ScheduleProblem,
+    schedule: PlannedSchedule,
+    *,
+    context: _ProductionScoringContext,
+) -> Decimal:
+    """Reproduce canonical priority-postponement accumulation exactly."""
+
+    item_by_id = problem.item_by_id
+
+    by_item: dict[
+        int,
+        list[WorkAllocation],
+    ] = defaultdict(list)
+
+    for row in schedule.work_allocations:
+        by_item[
+            row.item_id
+        ].append(row)
+
+    completion_by_item: dict[
+        int,
+        date,
+    ] = {}
+
+    for item_id, rows in by_item.items():
+        rows = sorted(
+            rows,
+            key=lambda row:
+                row.scheduled_date,
+        )
+
+        by_item[
+            item_id
+        ] = rows
+
+        completion_by_item[
+            item_id
+        ] = rows[-1].scheduled_date
+
+    priority_postponement_days = D("0")
+
+    for item_id, rows in by_item.items():
+        item = item_by_id[
+            item_id
+        ]
+
+        weight = (
+            context.priority_weight_by_item[
+                item_id
+            ]
+        )
+
+        if weight > 0 and rows:
+            earliest = max(
+                problem.today,
+                item.release_date
+                or problem.today,
+            )
+
+            if item.anchor_date is not None:
+                earliest = item.anchor_date
+
+            else:
+                for prerequisite_id in (
+                    problem.direct_prerequisites(
+                        item_id
+                    )
+                ):
+                    prerequisite_rows = (
+                        by_item.get(
+                            prerequisite_id,
+                            (),
+                        )
+                    )
+
+                    if prerequisite_rows:
+                        prerequisite_completion = (
+                            completion_by_item[
+                                prerequisite_id
+                            ]
+                        )
+
+                        earliest = max(
+                            earliest,
+                            prerequisite_completion
+                            + timedelta(days=1),
+                        )
+
+            actual_start = (
+                rows[0].scheduled_date
+            )
+
+            delay = max(
+                0,
+                (
+                    actual_start
+                    - earliest
+                ).days,
+            )
+
+            priority_postponement_days += (
+                D(delay)
+                * weight
+            )
+
+    return priority_postponement_days
+
+
+def _score_local_candidate(
+    problem: ScheduleProblem,
+    current: PlannedSchedule,
+    candidate: PlannedSchedule,
+    current_objective: ProductionObjective,
+    *,
+    changed_item_ids: frozenset[int],
+    changed_dates: frozenset[date],
+    context: _ProductionScoringContext,
+) -> ProductionObjective:
+    # Lock-in's avoidable-idle metric is intentionally global: moving one item
+    # can change whether an earlier empty day was avoidable. Keep the full
+    # scorer there until a separately verified incremental formulation exists.
+    if current.flavour == "lock-in":
+        return score_production_schedule(
+            problem,
+            candidate,
+            context=context,
+        )
+
+    impacted_item_ids = set(
+        changed_item_ids
+    )
+
+    for item_id in changed_item_ids:
+        impacted_item_ids.update(
+            problem.direct_dependents(
+                item_id
+            )
+        )
+
+    needed_item_ids = set(
+        impacted_item_ids
+    )
+
+    for item_id in impacted_item_ids:
+        needed_item_ids.update(
+            problem.direct_prerequisites(
+                item_id
+            )
+        )
+
+    current_rows = _rows_for_items(
+        current,
+        needed_item_ids,
+    )
+    candidate_rows = _rows_for_items(
+        candidate,
+        needed_item_ids,
+    )
+
+    old_item = _ItemScoreContribution()
+    new_item = _ItemScoreContribution()
+
+    for item_id in impacted_item_ids:
+        old = _item_score_contribution(
+            problem,
+            current,
+            item_id=item_id,
+            rows_by_item=current_rows,
+            context=context,
+        )
+        new = _item_score_contribution(
+            problem,
+            candidate,
+            item_id=item_id,
+            rows_by_item=candidate_rows,
+            context=context,
+        )
+
+        old_item = _ItemScoreContribution(
+            late_hours=
+                old_item.late_hours
+                + old.late_hours,
+            tiny_nonfinal_sessions=
+                old_item.tiny_nonfinal_sessions
+                + old.tiny_nonfinal_sessions,
+            session_shape_penalty=
+                old_item.session_shape_penalty
+                + old.session_shape_penalty,
+            fragmentation_count=
+                old_item.fragmentation_count
+                + old.fragmentation_count,
+            priority_postponement_days=
+                old_item.priority_postponement_days
+                + old.priority_postponement_days,
+            continuity_gap_days=
+                old_item.continuity_gap_days
+                + old.continuity_gap_days,
+            deadline_buffer_risk=
+                old_item.deadline_buffer_risk
+                + old.deadline_buffer_risk,
+            completion_day_sum=
+                old_item.completion_day_sum
+                + old.completion_day_sum,
+            unjustified_marathon_excess_hours=
+                old_item.unjustified_marathon_excess_hours
+                + old.unjustified_marathon_excess_hours,
+        )
+
+        new_item = _ItemScoreContribution(
+            late_hours=
+                new_item.late_hours
+                + new.late_hours,
+            tiny_nonfinal_sessions=
+                new_item.tiny_nonfinal_sessions
+                + new.tiny_nonfinal_sessions,
+            session_shape_penalty=
+                new_item.session_shape_penalty
+                + new.session_shape_penalty,
+            fragmentation_count=
+                new_item.fragmentation_count
+                + new.fragmentation_count,
+            priority_postponement_days=
+                new_item.priority_postponement_days
+                + new.priority_postponement_days,
+            continuity_gap_days=
+                new_item.continuity_gap_days
+                + new.continuity_gap_days,
+            deadline_buffer_risk=
+                new_item.deadline_buffer_risk
+                + new.deadline_buffer_risk,
+            completion_day_sum=
+                new_item.completion_day_sum
+                + new.completion_day_sum,
+            unjustified_marathon_excess_hours=
+                new_item.unjustified_marathon_excess_hours
+                + new.unjustified_marathon_excess_hours,
+        )
+
+    old_day = _DayScoreContribution()
+    new_day = _DayScoreContribution()
+
+    for day in changed_dates:
+        old = _day_score_contribution(
+            current.daily_hours.get(
+                day,
+                D("0"),
+            ),
+            policy=context.policy,
+        )
+        new = _day_score_contribution(
+            candidate.daily_hours.get(
+                day,
+                D("0"),
+            ),
+            policy=context.policy,
+        )
+
+        old_day = _DayScoreContribution(
+            infeasible_day_count=
+                old_day.infeasible_day_count
+                + old.infeasible_day_count,
+            infeasible_excess_hours=
+                old_day.infeasible_excess_hours
+                + old.infeasible_excess_hours,
+            overloaded_day_count=
+                old_day.overloaded_day_count
+                + old.overloaded_day_count,
+            overloaded_excess_hours=
+                old_day.overloaded_excess_hours
+                + old.overloaded_excess_hours,
+            preferred_excess_squared=
+                old_day.preferred_excess_squared
+                + old.preferred_excess_squared,
+        )
+
+        new_day = _DayScoreContribution(
+            infeasible_day_count=
+                new_day.infeasible_day_count
+                + new.infeasible_day_count,
+            infeasible_excess_hours=
+                new_day.infeasible_excess_hours
+                + new.infeasible_excess_hours,
+            overloaded_day_count=
+                new_day.overloaded_day_count
+                + new.overloaded_day_count,
+            overloaded_excess_hours=
+                new_day.overloaded_excess_hours
+                + new.overloaded_excess_hours,
+            preferred_excess_squared=
+                new_day.preferred_excess_squared
+                + new.preferred_excess_squared,
+        )
+
+    objective = ProductionObjective(
+        late_hours=(
+            current_objective.late_hours
+            - old_item.late_hours
+            + new_item.late_hours
+        ),
+        infeasible_day_count=(
+            current_objective.infeasible_day_count
+            - old_day.infeasible_day_count
+            + new_day.infeasible_day_count
+        ),
+        infeasible_excess_hours=(
+            current_objective.infeasible_excess_hours
+            - old_day.infeasible_excess_hours
+            + new_day.infeasible_excess_hours
+        ),
+        overloaded_day_count=(
+            current_objective.overloaded_day_count
+            - old_day.overloaded_day_count
+            + new_day.overloaded_day_count
+        ),
+        overloaded_excess_hours=(
+            current_objective.overloaded_excess_hours
+            - old_day.overloaded_excess_hours
+            + new_day.overloaded_excess_hours
+        ),
+        tiny_nonfinal_sessions=(
+            current_objective.tiny_nonfinal_sessions
+            - old_item.tiny_nonfinal_sessions
+            + new_item.tiny_nonfinal_sessions
+        ),
+        session_shape_penalty=(
+            current_objective.session_shape_penalty
+            - old_item.session_shape_penalty
+            + new_item.session_shape_penalty
+        ),
+        fragmentation_count=(
+            current_objective.fragmentation_count
+            - old_item.fragmentation_count
+            + new_item.fragmentation_count
+        ),
+        priority_postponement_days=(
+            _priority_postponement_days_exact(
+                problem,
+                candidate,
+                context=context,
+            )
+        ),
+        continuity_gap_days=(
+            current_objective.continuity_gap_days
+            - old_item.continuity_gap_days
+            + new_item.continuity_gap_days
+        ),
+        max_daily_hours=max(
+            candidate.daily_hours.values(),
+            default=D("0"),
+        ),
+        preferred_excess_squared=(
+            current_objective.preferred_excess_squared
+            - old_day.preferred_excess_squared
+            + new_day.preferred_excess_squared
+        ),
+        avoidable_idle_days=
+            current_objective.avoidable_idle_days,
+        deadline_buffer_risk=(
+            current_objective.deadline_buffer_risk
+            - old_item.deadline_buffer_risk
+            + new_item.deadline_buffer_risk
+        ),
+        completion_day_sum=(
+            current_objective.completion_day_sum
+            - old_item.completion_day_sum
+            + new_item.completion_day_sum
+        ),
+        unjustified_marathon_excess_hours=(
+            current_objective.unjustified_marathon_excess_hours
+            - old_item.unjustified_marathon_excess_hours
+            + new_item.unjustified_marathon_excess_hours
+        ),
+    )
+
+    if _VERIFY_INCREMENTAL_SCORING:
+        full = score_production_schedule(
+            problem,
+            candidate,
+            context=context,
+        )
+
+        if objective != full:
+            raise AssertionError(
+                "Incremental scoring disagrees with full scoring: "
+                f"incremental={objective} full={full}"
+            )
+
+    return objective
+
+
+def _score_move_candidate(
+    problem: ScheduleProblem,
+    current: PlannedSchedule,
+    candidate: PlannedSchedule,
+    current_objective: ProductionObjective,
+    move: WorkHourMove | CompoundWorkHourMove,
+    *,
+    context: _ProductionScoringContext,
+) -> ProductionObjective:
+    if isinstance(
+        move,
+        CompoundWorkHourMove,
+    ):
+        parts = (
+            move.first,
+            move.second,
+        )
+    else:
+        parts = (move,)
+
+    changed_item_ids = frozenset(
+        part.item_id
+        for part in parts
+    )
+    changed_dates = frozenset(
+        day
+        for part in parts
+        for day in (
+            part.from_date,
+            part.to_date,
+        )
+    )
+
+    return _score_local_candidate(
+        problem,
+        current,
+        candidate,
+        current_objective,
+        changed_item_ids=
+            changed_item_ids,
+        changed_dates=
+            changed_dates,
+        context=context,
     )
 
 
@@ -3604,9 +4341,12 @@ def improve_production_schedule(
                     continue
 
                 objective = (
-                    score_production_schedule(
+                    _score_move_candidate(
                         problem,
+                        current,
                         candidate,
+                        current_objective,
+                        move,
                         context=scoring_context,
                     )
                 )
@@ -3686,9 +4426,12 @@ def improve_production_schedule(
                 continue
 
             objective = (
-                score_production_schedule(
+                _score_move_candidate(
                     problem,
+                    current,
                     candidate,
+                    current_objective,
+                    move,
                     context=scoring_context,
                 )
             )
@@ -3882,9 +4625,12 @@ def improve_production_schedule(
                 continue
 
             objective = (
-                score_production_schedule(
+                _score_move_candidate(
                     problem,
+                    current,
                     candidate,
+                    current_objective,
+                    move,
                     context=scoring_context,
                 )
             )
@@ -3929,9 +4675,12 @@ def improve_production_schedule(
                     continue
 
                 objective = (
-                    score_production_schedule(
+                    _score_move_candidate(
                         problem,
+                        current,
                         candidate,
+                        current_objective,
+                        move,
                         context=scoring_context,
                     )
                 )
@@ -3993,9 +4742,12 @@ def improve_production_schedule(
                 continue
 
             objective = (
-                score_production_schedule(
+                _score_move_candidate(
                     problem,
+                    current,
                     candidate,
+                    current_objective,
+                    move,
                     context=scoring_context,
                 )
             )
@@ -4043,9 +4795,12 @@ def improve_production_schedule(
                     continue
 
                 objective = (
-                    score_production_schedule(
+                    _score_move_candidate(
                         problem,
+                        current,
                         candidate,
+                        current_objective,
+                        move,
                         context=scoring_context,
                     )
                 )
