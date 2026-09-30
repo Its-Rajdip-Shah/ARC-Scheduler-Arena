@@ -23,6 +23,7 @@ Production moves operate in estimated work-hours.
 from __future__ import annotations
 
 from collections import defaultdict
+import os
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
@@ -42,6 +43,7 @@ from arc_scheduler.engine.work_mass import (
     DayHeadroom,
     WorkAllocation,
     allocate_work_mass,
+    is_dynamic_plan_hard_valid,
     validate_dynamic_plan,
     work_allocations_to_plan,
 )
@@ -52,6 +54,13 @@ from arc_scheduler.engine.mechanics import effective_bucket
 
 
 D = Decimal
+
+_VERIFY_FAST_VALIDATION = (
+    os.environ.get(
+        "ARC_VERIFY_FAST_VALIDATION"
+    )
+    == "1"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -931,14 +940,31 @@ def _rebuild(
             )
         )
 
-        validation = (
-            validate_dynamic_plan(
+        hard_valid = (
+            is_dynamic_plan_hard_valid(
                 problem,
                 plan,
             )
         )
 
-        if validation.violations:
+        if _VERIFY_FAST_VALIDATION:
+            full_hard_valid = not (
+                validate_dynamic_plan(
+                    problem,
+                    plan,
+                ).violations
+            )
+
+            if (
+                hard_valid
+                != full_hard_valid
+            ):
+                raise AssertionError(
+                    "Fast candidate validation "
+                    "disagrees with full validation"
+                )
+
+        if not hard_valid:
             return None
 
     except (

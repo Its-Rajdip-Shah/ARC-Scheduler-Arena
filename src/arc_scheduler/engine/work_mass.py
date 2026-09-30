@@ -31,6 +31,7 @@ from arc_scheduler.engine.mechanics import (
 )
 from arc_scheduler.engine.validation import (
     ValidationResult,
+    is_plan_hard_valid,
     validate_plan,
 )
 from arc_scheduler.focus_order import focus_bucket_key
@@ -825,6 +826,16 @@ def validate_dynamic_plan(
     """Production dynamic plans use the same independent ARC validator."""
 
     return validate_plan(
+        problem,
+        plan,
+    )
+
+
+def is_dynamic_plan_hard_valid(
+    problem: ScheduleProblem,
+    plan: SchedulePlan,
+) -> bool:
+    return is_plan_hard_valid(
         problem,
         plan,
     )

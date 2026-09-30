@@ -393,3 +393,251 @@ def validate_plan(
         infeasibilities=tuple(sorted(infeasibilities)),
         soft_violations=tuple(sorted(soft_violations)),
     )
+
+
+def is_plan_hard_valid(
+    problem: ScheduleProblem,
+    plan: SchedulePlan,
+) -> bool:
+    """Fast boolean check for hard-invalid candidate states only."""
+
+    item_by_id = problem.item_by_id
+
+    allocations_by_item = {
+        item_id: []
+        for item_id in item_by_id
+    }
+
+    percentage_by_item = {
+        item_id: Decimal("0")
+        for item_id in item_by_id
+    }
+
+    first_by_item = {}
+    start_date_by_item = {}
+    completion_date_by_item = {}
+    bucket_rows = {}
+    rank_keys = set()
+
+    for allocation in plan.allocations:
+        item = item_by_id.get(
+            allocation.item_id
+        )
+
+        if item is None:
+            return False
+
+        rank_key = (
+            allocation.scheduled_date,
+            allocation.execution_rank,
+        )
+
+        if rank_key in rank_keys:
+            return False
+
+        rank_keys.add(rank_key)
+
+        if allocation.scheduled_date < problem.today:
+            return False
+
+        if (
+            item.release_date is not None
+            and allocation.scheduled_date
+            < item.release_date
+        ):
+            return False
+
+        item_id = allocation.item_id
+
+        allocations_by_item[
+            item_id
+        ].append(allocation)
+
+        percentage_by_item[
+            item_id
+        ] += allocation.percentage
+
+        previous_first = first_by_item.get(
+            item_id
+        )
+
+        if (
+            previous_first is None
+            or (
+                allocation.scheduled_date,
+                allocation.execution_rank,
+            )
+            < (
+                previous_first.scheduled_date,
+                previous_first.execution_rank,
+            )
+        ):
+            first_by_item[
+                item_id
+            ] = allocation
+
+        previous_start = start_date_by_item.get(
+            item_id
+        )
+
+        if (
+            previous_start is None
+            or allocation.scheduled_date
+            < previous_start
+        ):
+            start_date_by_item[
+                item_id
+            ] = allocation.scheduled_date
+
+        previous_completion = (
+            completion_date_by_item.get(
+                item_id
+            )
+        )
+
+        if (
+            previous_completion is None
+            or allocation.scheduled_date
+            > previous_completion
+        ):
+            completion_date_by_item[
+                item_id
+            ] = allocation.scheduled_date
+
+        focus_bucket = focus_bucket_key(
+            item.duration_category,
+            is_residual=item.is_residual,
+        )
+
+        bucket_rows.setdefault(
+            (
+                allocation.scheduled_date,
+                focus_bucket,
+            ),
+            [],
+        ).append(allocation)
+
+    for item_id, item in item_by_id.items():
+        rows = allocations_by_item[
+            item_id
+        ]
+
+        if (
+            percentage_by_item[item_id]
+            != item.remaining_fraction
+            * Decimal("100")
+        ):
+            return False
+
+        if rows:
+            bucket = (
+                "UNDER_20_MINUTES"
+                if item.is_residual
+                else item.duration_category
+            )
+
+            if (
+                bucket
+                in {
+                    "UNDER_20_MINUTES",
+                    "UNDER_1_HOUR",
+                    "UNDER_4_HOURS",
+                }
+                and len(rows) != 1
+            ):
+                return False
+
+        if (
+            item.anchor_date is None
+            or not rows
+        ):
+            continue
+
+        first = first_by_item[
+            item_id
+        ]
+
+        if (
+            first.scheduled_date
+            != item.anchor_date
+        ):
+            return False
+
+        if item.anchor_order is None:
+            continue
+
+        focus_bucket = focus_bucket_key(
+            item.duration_category,
+            is_residual=item.is_residual,
+        )
+
+        ordered_bucket = sorted(
+            bucket_rows.get(
+                (
+                    item.anchor_date,
+                    focus_bucket,
+                ),
+                (),
+            ),
+            key=lambda row:
+                row.execution_rank,
+        )
+
+        local_position = next(
+            (
+                index
+                for index, row
+                in enumerate(
+                    ordered_bucket,
+                    start=1,
+                )
+                if row.item_id
+                == item_id
+            ),
+            None,
+        )
+
+        if (
+            item.anchor_order
+            <= len(ordered_bucket)
+            and local_position
+            != item.anchor_order
+        ):
+            return False
+
+    for edge in problem.dependencies:
+        prerequisite_completion = (
+            completion_date_by_item.get(
+                edge.prerequisite_id
+            )
+        )
+
+        dependent_start = (
+            start_date_by_item.get(
+                edge.dependent_id
+            )
+        )
+
+        if (
+            prerequisite_completion is None
+            or dependent_start is None
+            or dependent_start
+            > prerequisite_completion
+        ):
+            continue
+
+        prerequisite = item_by_id[
+            edge.prerequisite_id
+        ]
+
+        dependent = item_by_id[
+            edge.dependent_id
+        ]
+
+        if (
+            prerequisite.anchor_date is None
+            and dependent.anchor_date is None
+        ):
+            return False
+
+    return True
