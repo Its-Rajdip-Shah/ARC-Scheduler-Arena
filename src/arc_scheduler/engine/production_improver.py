@@ -853,10 +853,32 @@ def _rebuild(
             )
         )
 
+        changed_dates: frozenset[date] | None = None
+
+        if changed_item_ids is not None:
+            changed_dates = frozenset(
+                {
+                    row.scheduled_date
+                    for row in original.work_allocations
+                    if row.item_id in changed_item_ids
+                }
+                | {
+                    row.scheduled_date
+                    for row in work_allocations
+                    if row.item_id in changed_item_ids
+                }
+            )
+
         plan = (
             work_allocations_to_plan(
                 work_allocations,
                 problem=problem,
+                original_plan=(
+                    original.plan
+                    if changed_dates is not None
+                    else None
+                ),
+                changed_dates=changed_dates,
             )
         )
 

@@ -730,6 +730,8 @@ def work_allocations_to_plan(
     ],
     *,
     problem: ScheduleProblem | None = None,
+    original_plan: SchedulePlan | None = None,
+    changed_dates: frozenset[date] | None = None,
 ) -> SchedulePlan:
     """Convert dynamic work allocations to disposable ARC plan rows.
 
@@ -750,9 +752,43 @@ def work_allocations_to_plan(
             allocation
         )
 
+    reusable_plan_rows: dict[
+        date,
+        list[Allocation],
+    ] = {}
+
+    if (
+        original_plan is not None
+        and changed_dates is not None
+    ):
+        for allocation in original_plan.allocations:
+            if allocation.scheduled_date in changed_dates:
+                continue
+
+            reusable_plan_rows.setdefault(
+                allocation.scheduled_date,
+                [],
+            ).append(
+                allocation
+            )
+
     rows = []
 
     for day in sorted(by_day):
+        reusable = reusable_plan_rows.get(
+            day
+        )
+
+        if reusable is not None:
+            rows.extend(
+                sorted(
+                    reusable,
+                    key=lambda allocation:
+                        allocation.execution_rank,
+                )
+            )
+            continue
+
         ordered = _order_day_for_execution(
             tuple(
                 by_day[day]
