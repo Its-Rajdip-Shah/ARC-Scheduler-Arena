@@ -110,10 +110,13 @@ def monthly_statuses(
     preferred_daily_hours: Decimal,
     soft_max_daily_hours: Decimal,
 ) -> dict[str, LoadBand]:
-    by_month: dict[str, Decimal] = {}
+    by_month: dict[tuple[int, int], Decimal] = {}
 
     for day, hours in daily_hours.items():
-        key = day.strftime("%Y-%m")
+        key = (
+            day.year,
+            day.month,
+        )
 
         by_month[key] = (
             by_month.get(key, D("0"))
@@ -122,18 +125,17 @@ def monthly_statuses(
 
     result = {}
 
-    for key, hours in sorted(by_month.items()):
-        year, month = map(
-            int,
-            key.split("-"),
-        )
-
+    for (year, month), hours in sorted(
+        by_month.items()
+    ):
         days = D(
             monthrange(
                 year,
                 month,
             )[1]
         )
+
+        key = f"{year:04d}-{month:02d}"
 
         result[key] = LoadBand(
             hours=hours,
